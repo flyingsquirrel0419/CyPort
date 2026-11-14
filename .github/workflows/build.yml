@@ -1,0 +1,62 @@
+# Builds CyPort without the game (build.sh NO_GAME=1) into an unsigned IPA. No game files are involved: on the phone
+# the app signs in to Steam, downloads the Mac game program from the user's own account, converts it and writes an IPA
+# with it to install over itself (shim/GameInstaller.swift). Sign/install the IPA with SideStore, AltStore, LiveContainer...
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # the release on tags
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the newest Xcode
+        # the iOS SDK it brings is stamped into the app (an iPhone Duo needs the iOS 27 SDK for its real screen sizes)
+        run: |
+          X="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -n 1)"
+          sudo xcode-select -s "$X/Contents/Developer"
+          xcodebuild -version
+
+      - name: Test on-screen controller layout
+        run: tools/test_pad_layout.sh
+
+      - name: Test on-device retargeting against ios_retarget.py
+        # a real arm64 macOS executable (ripgrep) with the game's patch sites planted in it
+        run: |
+          T="$RUNNER_TEMP/retarget"; mkdir -p "$T/rg"
+          curl -sSfL -o "$T/rg.tgz" https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-aarch64-apple-darwin.tar.gz
+          tar xzf "$T/rg.tgz" -C "$T/rg"
+          RG="$(find "$T/rg" -type f -name rg)"
+          python3 -I tools/retarget_test/make_fixture.py "$RG" "$T/rg-fixture"
+          tools/test_retarget.sh "$T/rg-fixture" "$RG"
+
+      - name: Build the Mac Steam downloader (compile check)
+        run: tools/steam_download.sh --help
+
+      - name: Build CyPort (no game, unsigned)
+        run: NO_GAME=1 ./build.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CyPort-unsigned
+          path: build/CyPort-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Release (tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/CyPort-unsigned.ipa
+          body: |
+            Unsigned CyPort without the game. Install it with SideStore / AltStore / LiveContainer, open it, sign in to
+            Steam with the account that owns Cyberpunk 2077 and follow the setup screen (see README, "No Mac").

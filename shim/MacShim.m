@@ -5965,6 +5965,29 @@ __attribute__((constructor)) static void MSInstallURLSession(void) {
  * version the start screen's Update chose (CyPortGameVersion), else the newest. Then its game program is loaded and
  * its main() runs exactly as an executable's would. */
 extern char **environ;
+/* No game in the app (the IPA GitHub Actions builds, build.sh NO_GAME=1 - it has an empty Games/): the setup screen
+   signs in to Steam, gets the Mac game program and makes an IPA with it to install over this app
+   (shim/InstallerUI.swift + GameInstaller.swift). */
+@interface MSInstallerDelegate : UIResponder <UIApplicationDelegate> @property(nonatomic, strong) UIWindow *window; @end
+@implementation MSInstallerDelegate
+- (BOOL)msWaitForScene { return YES; }
+- (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)o {
+    if (!MSAppScene()) return YES;                    /* MSSceneDelegate calls this again once the scene is there */
+    self.window = [[UIWindow alloc] initWithWindowScene:MSAppScene()];
+    Class c = NSClassFromString(@"MSInstallerUI"); UIViewController *vc = nil;
+    if (c) vc = ((UIViewController *(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"make"));
+    if (!vc) {                                        /* a shim built without the Swift screens */
+        vc = [UIViewController new]; vc.view.backgroundColor = UIColor.blackColor;
+        UILabel *l = [UILabel new]; l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; l.textColor = UIColor.whiteColor;
+        l.text = @"This CyPort has no game program.\nBuild it with build.sh from your own copy of Cyberpunk 2077 (see README).";
+        l.translatesAutoresizingMaskIntoConstraints = NO; [vc.view addSubview:l];
+        [NSLayoutConstraint activateConstraints:@[ [l.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor], [l.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor],
+                                                   [l.widthAnchor constraintLessThanOrEqualToAnchor:vc.view.widthAnchor constant:-48] ]];
+    }
+    self.window.rootViewController = vc; [self.window makeKeyAndVisible];
+    return YES;
+}
+@end
 __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
     NSString *games = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Games"];
     NSMutableArray<NSDictionary *> *vers = [NSMutableArray array];
@@ -5974,7 +5997,11 @@ __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
         if (pl && [NSFileManager.defaultManager fileExistsAtPath:[dir stringByAppendingPathComponent:@"CyberpunkGame.dylib"]])
             [vers addObject:@{ @"dir": dir, @"plist": pl }];
     }
-    if (!vers.count) { MSLogf(@"starter: no game versions in %@", games); abort(); }
+    if (!vers.count) {
+        MSLogf(@"starter: no game versions in %@ - showing the setup screen (get the game from Steam)", games);
+        @autoreleasepool { UIApplicationMain(argc, argv, nil, NSStringFromClass([MSInstallerDelegate class])); }
+        exit(0);
+    }
     [vers sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {      /* newest first */
         return [b[@"plist"][@"number"] compare:a[@"plist"][@"number"] ?: @0];
     }];

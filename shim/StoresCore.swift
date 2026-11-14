@@ -1,7 +1,8 @@
 // Store downloads: sign in to Steam, GOG or Epic and download the Mac version of Cyberpunk 2077's game data
 // (archive, engine, r6) straight into the app - only when the account owns the game (each store refuses the
 // download otherwise). The executable is not downloaded: iOS only runs code that was signed into the app, so it
-// still comes from the Mac build (build.sh).
+// still comes from the Mac build (build.sh). The Mac download tool (tools/steam_download) uses the same code to download the
+// arm64 Mac program itself (GameFiles.Scope.program / .all) for build.sh.
 //
 // Written for CyPort. The store protocols were worked out from the stores' public behaviour and from how other
 // open clients (legendary, heroic-gogdl, SteamKit, playport) talk to them; no code is copied from them.
@@ -203,7 +204,21 @@ enum Net {
 
 enum Keychain {
     static let service = "cyport.stores"
+    /// Mac download tool: a JSON file (mode 0600) instead of the Keychain - an unsigned command line tool can't rely
+    /// on the data-protection keychain. nil (the app): the Keychain.
+    static var fileURL: URL?
+    private static func fileItems() -> [String: Any] {
+        guard let u = fileURL, let d = try? Data(contentsOf: u) else { return [:] }
+        return (try? JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
+    }
+    private static func writeFile(_ items: [String: Any]) {
+        guard let u = fileURL, let d = try? JSONSerialization.data(withJSONObject: items) else { return }
+        try? FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        _ = FileManager.default.createFile(atPath: u.path, contents: d, attributes: [.posixPermissions: 0o600])
+    }
     static func save(_ key: String, _ value: [String: Any]) {
+        if fileURL != nil { var all = fileItems(); all[key] = value; writeFile(all); return }
         guard let d = try? JSONSerialization.data(withJSONObject: value) else { return }
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: key]
         SecItemDelete(q as CFDictionary)
@@ -211,6 +226,7 @@ enum Keychain {
         SecItemAdd(add as CFDictionary, nil)
     }
     static func load(_ key: String) -> [String: Any]? {
+        if fileURL != nil { return fileItems()[key] as? [String: Any] }
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: key,
                                 kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var out: CFTypeRef?
@@ -218,6 +234,7 @@ enum Keychain {
         return try? JSONSerialization.jsonObject(with: d) as? [String: Any]
     }
     static func delete(_ key: String) {
+        if fileURL != nil { var all = fileItems(); all[key] = nil; writeFile(all); return }
         SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: key] as CFDictionary)
     }
 }
@@ -236,36 +253,73 @@ struct DLPlan {
     var version: String                 /// identifies this build (resume journal)
     var versionName: String             /// the game version as the store names it ("2.31a_mac"), for the screen
     var fetch: @Sendable (Int) async throws -> Data
+    /// symbolic links in the download (path -> target), relative to the game folder; the app never needs them, the Mac
+    /// download tool (tools/steam_download) creates them inside Cyberpunk2077.app
+    var links: [String: String] = [:]
     var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
 }
 
 enum GameFiles {
     static let dataDirs = ["archive", "engine", "r6"]
-    /// Keep only the game's data folders (the Mac app bundle with the executable is skipped) and make their paths
-    /// relative to the game folder, wherever the store puts it.
-    static func pick(_ files: [DLFile]) throws -> [DLFile] {
+    static let appBundle = "cyberpunk2077.app"
+    /// what a download keeps: the data folders (the app: its program comes from build.sh), only the Mac program
+    /// (Cyberpunk2077.app, for build.sh), or the whole game folder
+    enum Scope { case data, program, all }
+
+    /// the folder inside the store's download that holds the game (wherever the store puts it), lowercased
+    static func root(_ paths: [String]) -> String? {
         var prefix: String?
-        for f in files {
-            let l = f.path.lowercased()
-            guard let r = l.range(of: "r6/") else { continue }
-            let p = String(l[..<r.lowerBound])
-            guard p.isEmpty || p.hasSuffix("/") else { continue }
-            if prefix == nil || p.count < prefix!.count { prefix = p }
+        for l in paths.map({ $0.lowercased() }) {
+            for marker in ["r6/", appBundle + "/"] {
+                guard let r = l.range(of: marker) else { continue }
+                let p = String(l[..<r.lowerBound])
+                guard p.isEmpty || p.hasSuffix("/") else { continue }
+                if prefix == nil || p.count < prefix!.count { prefix = p }
+            }
         }
-        guard let pre = prefix else { throw StoreError("This download doesn't contain the game's data folders (archive, engine, r6).") }
+        return prefix
+    }
+    /// `path` relative to the game folder, if `scope` keeps it
+    static func relative(_ path: String, root pre: String, scope: Scope) -> String? {
+        guard path.lowercased().hasPrefix(pre) else { return nil }
+        let rel = String(path.dropFirst(pre.count))
+        guard let top = rel.split(separator: "/").first, rel.contains("/") else { return nil }
+        guard !rel.split(separator: "/").contains(where: { $0 == ".." || $0 == "." }) else { return nil }
+        switch scope {
+        case .data: guard dataDirs.contains(top.lowercased()) else { return nil }
+        case .program: guard top.lowercased() == appBundle else { return nil }
+        case .all: break
+        }
+        return rel
+    }
+    /// Keep the files `scope` asks for (by default only the game's data folders: the Mac app bundle with the
+    /// executable is skipped) and make their paths relative to the game folder, wherever the store puts it.
+    static func pick(_ files: [DLFile], scope: Scope = .data) throws -> [DLFile] {
+        let what = scope == .program ? "the Mac program (Cyberpunk2077.app)" : "the game's data folders (archive, engine, r6)"
+        guard let pre = root(files.map(\.path)) else { throw StoreError("This download doesn't contain \(what).") }
         var byPath: [String: DLFile] = [:], order: [String] = []
         for var f in files {
-            let l = f.path.lowercased()
-            guard l.hasPrefix(pre) else { continue }
-            let rel = String(f.path.dropFirst(pre.count))
-            guard let top = rel.split(separator: "/").first, dataDirs.contains(top.lowercased()), rel.contains("/") else { continue }
-            guard !rel.split(separator: "/").contains(where: { $0 == ".." || $0 == "." }) else { continue }
+            guard let rel = relative(f.path, root: pre, scope: scope) else { continue }
             f.path = rel
             if byPath[rel.lowercased()] == nil { order.append(rel.lowercased()) }
             byPath[rel.lowercased()] = f                         // a later depot (DLC, language) wins
         }
         let out = order.compactMap { byPath[$0] }
-        guard !out.isEmpty else { throw StoreError("This download doesn't contain the game's data folders.") }
+        guard !out.isEmpty else { throw StoreError("This download doesn't contain \(what).") }
+        if scope != .data && !out.contains(where: { $0.path.lowercased() == appBundle + "/contents/macos/cyberpunk2077" }) {
+            throw StoreError("This download has no Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077.")
+        }
+        return out
+    }
+    /// the symbolic links `scope` keeps, relative to the game folder (same root as the files)
+    static func pickLinks(_ links: [(path: String, target: String)], files: [DLFile], scope: Scope) -> [String: String] {
+        guard scope != .data, let pre = root(files.map(\.path) + links.map(\.path)) else { return [:] }
+        var out: [String: String] = [:]
+        for l in links {
+            guard let rel = relative(l.path, root: pre, scope: scope) else { continue }
+            guard !l.target.hasPrefix("/") else { continue }                 // only links that stay inside the game
+            out[rel] = l.target
+        }
         return out
     }
 }
@@ -826,6 +880,9 @@ final class SteamStore: @unchecked Sendable {
             let os = (cfg?["oslist"]?.string ?? "").lowercased()
             let lang = (cfg?["language"]?.string ?? "").lowercased()
             guard os.split(separator: ",").contains("macos") else { continue }
+            // Apple Silicon only: skip depots Steam marks as 32-bit (osarch "32"); "64", "arm64" or none are fine
+            let arch = (cfg?["osarch"]?.string ?? "").lowercased()
+            guard arch.isEmpty || arch == "64" || arch == "arm64" else { continue }
             guard lang.isEmpty || lang == "english" else { continue }
             guard d["depotfromapp"] == nil else { continue }
             guard (cfg?["lowviolence"]?.string ?? "0") != "1" else { continue }
@@ -858,13 +915,15 @@ final class SteamStore: @unchecked Sendable {
         return out.map(\.0)
     }
 
-    /// the whole download: every owned Mac depot's files, chunk by chunk
-    func plan(progress: @escaping (String) -> Void) async throws -> DLPlan {
+    /// the whole download: every owned Mac depot's files, chunk by chunk (`scope`: the app takes only the data
+    /// folders, the Mac download tool also the arm64 program, Cyberpunk2077.app)
+    func plan(scope: GameFiles.Scope = .data, progress: @escaping (String) -> Void) async throws -> DLPlan {
         let (depots, build) = try await macDepots()
         let servers = try await servers()
         storeLog("steam: \(servers.count) download servers")
         struct ChunkRef { let depot: UInt32; let sha: Data; let crc: UInt32; let size: Int; let csize: Int }
         var chunks: [ChunkRef] = [], index: [Data: Int] = [:], files: [DLFile] = [], keys: [UInt32: Data] = [:]
+        var links: [(path: String, target: String)] = []
         var ownedAny = false
         for d in depots {
             progress("Reading Steam depot \(d.id)…")
@@ -886,6 +945,7 @@ final class SteamStore: @unchecked Sendable {
             }
             guard let raw = manifest else { throw last }
             for f in try Self.parseManifest(raw, key: key) {
+                if let t = f.link { links.append((f.path, t)); continue }
                 var parts: [DLPart] = []
                 for c in f.chunks.sorted(by: { $0.offset < $1.offset }) {
                     let k: Int
@@ -900,10 +960,11 @@ final class SteamStore: @unchecked Sendable {
             }
         }
         guard ownedAny else { throw StoreError("This Steam account doesn't own Cyberpunk 2077 (Steam refused the download key).") }
-        let picked = try GameFiles.pick(files)
+        let picked = try GameFiles.pick(files, scope: scope)
+        let pickedLinks = GameFiles.pickLinks(links, files: files, scope: scope)
         let refs = chunks, ks = keys, hosts = servers.map(\.host)
         let counter = Counter()
-        return DLPlan(files: picked, chunkCount: refs.count, version: "steam-\(build)", versionName: "Steam build \(build)", fetch: { i in
+        return DLPlan(files: picked, chunkCount: refs.count, version: scope == .data ? "steam-\(build)" : "steam-\(build)-\(scope)", versionName: "Steam build \(build)", fetch: { i in
             let c = refs[i]; var last: Error = StoreError("chunk")
             for attempt in 0..<6 {
                 let host = hosts[(counter.next() + attempt) % hosts.count]
@@ -916,10 +977,10 @@ final class SteamStore: @unchecked Sendable {
                 try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
             }
             throw last
-        })
+        }, links: pickedLinks)
     }
 
-    struct MFile { let path: String; let size: Int64; let chunks: [(sha: Data, crc: UInt32, offset: UInt64, size: Int, csize: Int)] }
+    struct MFile { let path: String; let size: Int64; let chunks: [(sha: Data, crc: UInt32, offset: UInt64, size: Int, csize: Int)]; var link: String? = nil }
     static func parseManifest(_ d: Data, key: Data) throws -> [MFile] {
         var at = 0, payload: Data?, encrypted = false
         while at + 8 <= d.count {
@@ -942,8 +1003,14 @@ final class SteamStore: @unchecked Sendable {
                 name = String(decoding: try AES.steamDecrypt(raw, key: key), as: UTF8.self)
                 while name.hasSuffix("\0") { name.removeLast() }
             }
-            if f.s(7).map({ !$0.isEmpty }) ?? false { continue }           // symlink
             name = name.replacingOccurrences(of: "\\", with: "/")
+            if let t = f.s(7), !t.isEmpty {                                // symlink (inside the Mac app bundle)
+                var target = t
+                if encrypted, let raw = Data(base64Encoded: t.filter { !$0.isWhitespace }), let plain = try? AES.steamDecrypt(raw, key: key) {
+                    target = String(decoding: plain, as: UTF8.self); while target.hasSuffix("\0") { target.removeLast() }
+                }
+                out.append(MFile(path: name, size: 0, chunks: [], link: target.replacingOccurrences(of: "\\", with: "/"))); continue
+            }
             var cs: [(Data, UInt32, UInt64, Int, Int)] = []
             for c in f.all(6) {
                 let cm = try PBMessage(c)

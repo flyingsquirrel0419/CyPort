@@ -7,3 +7,7 @@ Payload/
 .DS_Store
 *.bak*
 build-signed/
+
+# Steam download (tools/steam_download.sh): the game itself
+steam-game/
+__pycache__/
