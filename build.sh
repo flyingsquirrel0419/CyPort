@@ -26,8 +26,8 @@ if [ -z "${GAME_APP:-}" ] && [ -n "${STEAM_USER:-}" ]; then
   [ -n "$GAME_APP" ] || { echo "Steam download failed"; exit 1; }
 fi
 NO_GAME="${NO_GAME:-0}"
-if [ "$NO_GAME" = "1" ]; then GAME_APP=""; GAME_APPS=""; REBUILD_SHIM=1; else
-GAME_APP="${GAME_APP:?set GAME_APP to the Cyberpunk2077.app folder (or GAME_APPS to several, separated by |)}"
+if [ "$NO_GAME" = "1" ]; then GAME_APP=""; GAME_APPS=""; REBUILD_SHIM=1
+else GAME_APP="${GAME_APP:?set GAME_APP to the Cyberpunk2077.app folder (or GAME_APPS to several, separated by |, or STEAM_USER to download it from Steam, or NO_GAME=1)}"; fi
 BUNDLE_ID="${BUNDLE_ID:-com.example.cyport}"
 ENT="${ENT:-$HERE/app/entitlements-basic.plist}"
 # Output (override with OUT=/some/folder)
@@ -36,7 +36,8 @@ mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 1; }
 APP="$OUT/Payload/Cyberpunk2077.app"
 SDK_CACHE="${SDK_CACHE:-$OUT/.ios-sdk}"
 echo "==> output folder: $OUT"
-[ -f "$GAME_APP/Contents/MacOS/Cyberpunk2077" ] || { echo "not found: $GAME_APP/Contents/MacOS/Cyberpunk2077"; exit 1; }
+if [ "$NO_GAME" != "1" ]; then
+  [ -f "$GAME_APP/Contents/MacOS/Cyberpunk2077" ] || { echo "not found: $GAME_APP/Contents/MacOS/Cyberpunk2077"; exit 1; }
 fi
 rm -rf "$OUT/Payload" "$OUT"/*.ipa; mkdir -p "$APP/Frameworks"   # only our own outputs are cleared
 
