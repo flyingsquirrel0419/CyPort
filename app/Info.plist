@@ -45,6 +45,9 @@
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
 	<key>UIApplicationSupportsIndirectInputEvents</key><true/>
+	<!-- downloads keep going in Picture in Picture when you leave the app (shim/DownloadPiP.swift); only while a download runs -->
+	<key>UIBackgroundModes</key>
+	<array><string>audio</string></array>
 	<key>GCSupportsControllerUserInteraction</key><true/>
 	<!-- Game Mode: iOS prioritises the game's CPU/GPU work and lowers Bluetooth controller latency -->
 	<key>GCSupportsGameMode</key><true/>

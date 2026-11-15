@@ -80,8 +80,10 @@ final class InstallerModel: ObservableObject {
     func start(_ p: GameInstaller.Prepared) {
         phase = .downloading; progress = nil
         let inst = installer
+        DownloadPiP.shared.begin("Downloading the game program")
         run {
-            try await inst.downloader(p).run { pr in Task { @MainActor in self.progress = pr } }
+            defer { Task { @MainActor in DownloadPiP.shared.end() } }
+            try await inst.downloader(p).run { pr in Task { @MainActor in self.progress = pr; DownloadPiP.shared.update(pr) } }
             return try inst.build(p) { m in Task { @MainActor in self.phase = .working(m) } }
         } cancelled: { self.phase = .ready(p) }
     }
@@ -274,8 +276,9 @@ struct InstallerView: View {
                 Text("\(gb(pr.done, 2)) of \(gb(pr.total, 2)) · \(String(format: "%.1f", pr.bytesPerSecond / 1e6)) MB/s")
                     .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.85))
             } else { Text("Starting…").cyNote() }
-            Text("Keep the app open (the screen stays on). If it stops, it continues from where it was.").cyNote()
+            Text("If it stops, it continues from where it was.").cyNote()
             Button("Pause") { model.cancel() }.buttonStyle(CySecondaryButtonStyle())
+            DownloadPiPCard().padding(.top, 6)
         }.cyCard()
     }
 

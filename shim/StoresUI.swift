@@ -129,11 +129,12 @@ final class StoreModel: ObservableObject {
         let dest = gameFolder
         var bg = UIBackgroundTaskIdentifier.invalid
         bg = UIApplication.shared.beginBackgroundTask { UIApplication.shared.endBackgroundTask(bg) }
+        DownloadPiP.shared.begin(updateRoot != nil ? "Updating Cyberpunk" : "Downloading game data")
         task = Task {
-            defer { UIApplication.shared.isIdleTimerDisabled = false; UIApplication.shared.endBackgroundTask(bg) }
+            defer { UIApplication.shared.isIdleTimerDisabled = false; UIApplication.shared.endBackgroundTask(bg); DownloadPiP.shared.end() }
             do {
                 let d = Downloader(plan: p, dest: dest)
-                try await d.run { pr in Task { @MainActor in self.progress = pr } }
+                try await d.run { pr in Task { @MainActor in self.progress = pr; DownloadPiP.shared.update(pr) } }
                 try finish(dest)
             } catch is CancellationError { phase = .ready; updateSpace() }
             catch { phase = .failed(error.localizedDescription + "\n\nTap Download again to continue where it stopped."); storeLog("download stopped: \(error.localizedDescription)") }
@@ -297,7 +298,7 @@ struct StoreView: View {
                 }
                 Text("\(model.resuming ? "Continues the earlier download · " : "")Needs \(gb(model.needBytes)) · \(gb(model.freeBytes)) free")
                     .font(.caption).foregroundColor(model.needBytes > model.freeBytes ? .orange : .gray)
-                Text("Keep the app open while it downloads (the screen stays on). If it stops, it continues from where it was.")
+                Text("You can leave the app: the download keeps going in Picture in Picture. If it stops, it continues from where it was.")
                     .font(.caption).foregroundColor(.gray)
                 HStack {
                     Button("Back") { model.phase = .choose }
@@ -332,6 +333,7 @@ struct StoreView: View {
                 Text(pr.file).font(.caption2).foregroundColor(.gray).lineLimit(1)
             } else { Text("Starting…").font(.caption).foregroundColor(.gray) }
             Button("Pause") { model.cancel() }.buttonStyle(CySecondaryButtonStyle())
+            DownloadPiPCard().padding(.top, 6)
         }
     }
     func gb(_ b: Int64, _ decimals: Int = 1) -> String { String(format: "%.\(decimals)f GB", Double(b) / 1e9) }

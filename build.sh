@@ -73,7 +73,7 @@ if command -v swiftc >/dev/null 2>&1 || xcrun -f swiftc >/dev/null 2>&1; then
   SWIFTC="$(xcrun -f swiftc 2>/dev/null || command -v swiftc)"; TC="$(dirname "$(dirname "$SWIFTC")")"
   "$SWIFTC" -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -emit-object -module-name MacShimUI \
     -wmo "$HERE/shim/Launcher.swift" "$HERE/shim/StoresCore.swift" "$HERE/shim/StoresUI.swift" "$HERE/shim/GameCloud.swift" \
-    "$HERE/shim/MachORetarget.swift" "$HERE/shim/GameInstaller.swift" "$HERE/shim/InstallerUI.swift" "$HERE/shim/CyStyle.swift" -o "$APP/Frameworks/Launcher.o" \
+    "$HERE/shim/MachORetarget.swift" "$HERE/shim/GameInstaller.swift" "$HERE/shim/InstallerUI.swift" "$HERE/shim/CyStyle.swift" "$HERE/shim/DownloadPiP.swift" -o "$APP/Frameworks/Launcher.o" \
     || { echo "error: the SwiftUI screens (shim/*.swift) didn't compile - see above" >&2; exit 1; }
   SWIFT_OBJ="$APP/Frameworks/Launcher.o"
   SWIFT_LD="-L$SDK/usr/lib/swift -L$TC/lib/swift/iphoneos -Xlinker -rpath -Xlinker /usr/lib/swift"
@@ -81,7 +81,8 @@ fi
 clang $LDFLAG -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2 $SWIFT_LD \
   -install_name @rpath/libMacShim.dylib -compatibility_version 9999.0.0 -current_version 9999.0.0 \
   -framework Foundation -framework UIKit -framework GameController -framework QuartzCore \
-  -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit -lz \
+  -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit \
+  -framework AVFoundation -framework AVKit -framework CoreMedia -framework CoreVideo -lz \
   -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
   "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
   -o "$APP/Frameworks/libMacShim.dylib"
