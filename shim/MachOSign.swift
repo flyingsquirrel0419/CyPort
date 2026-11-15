@@ -87,7 +87,7 @@ enum MachOSign {
         cd += [UInt8](repeating: 0, count: 32)                                                 // slot -1: no Info.plist
         let reqHash = sha256(requirements[...])
         for k in 0..<32 { cd[cdHeader + ident.count + k] = reqHash[k] }
-        d.withUnsafeBufferPointer { p in
+        d.withUnsafeBytes { p in
             for i in 0..<nCode {
                 let a = i * pageSize, b = min(dataoff, a + pageSize)
                 cd += sha256(UnsafeRawBufferPointer(rebasing: p[a..<b]))
