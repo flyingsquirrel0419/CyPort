@@ -17,6 +17,7 @@ final class DownloadPiP: NSObject, ObservableObject {
     private var controller: AVPictureInPictureController?
     private var timer: Timer?
     private var title = "", fraction = 0.0, line1 = "Starting…", line2 = ""
+    private var lastDone: Int64 = 0, beatDone: Int64 = -1, beatAt = 0.0          // the 20 s heartbeat in macshim.log
     private static let size = CGSize(width: 640, height: 360)
 
     var supported: Bool { AVPictureInPictureController.isPictureInPictureSupported() }
@@ -29,7 +30,7 @@ final class DownloadPiP: NSObject, ObservableObject {
 
     /// a download starts: the card shows it, and leaving the app opens the PiP window
     func begin(_ title: String) {
-        self.title = title; fraction = 0; line1 = "Starting…"; line2 = ""
+        self.title = title; fraction = 0; line1 = "Starting…"; line2 = ""; beatDone = -1
         let s = AVAudioSession.sharedInstance()
         do { try s.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers]); try s.setActive(true) }
         catch { storeLog("pip: audio session: \(error.localizedDescription)") }
@@ -47,6 +48,7 @@ final class DownloadPiP: NSObject, ObservableObject {
     }
 
     func update(_ p: Downloader.Progress) {
+        lastDone = p.done
         fraction = p.total > 0 ? min(1, Double(p.done) / Double(p.total)) : 0
         line1 = String(format: "%.2f of %.2f GB · %.0f%%", Double(p.done) / 1e9, Double(p.total) / 1e9, fraction * 100)
         line2 = String(format: "%.1f MB/s", p.bytesPerSecond / 1e6) + " · " + Self.timeLeft(p.secondsLeft)
@@ -75,7 +77,22 @@ final class DownloadPiP: NSObject, ObservableObject {
 
     // MARK: drawing a frame
 
+    /// every 20 s while downloading: is the app still running in the background (PiP), how fast is it going
+    private func heartbeat() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if beatDone < 0 { beatDone = lastDone; beatAt = now; return }
+        guard now - beatAt >= 20 else { return }
+        let app = UIApplication.shared
+        let state = app.applicationState == .active ? "foreground" : app.applicationState == .background ? "background" : "inactive"
+        let left = app.backgroundTimeRemaining
+        storeLog(String(format: "download heartbeat: %@%@, PiP %@, %.2f MB/s over %.0f s, %.0f MB done", state,
+                        app.applicationState == .background ? (left > 1e8 ? " (kept running)" : String(format: " (iOS suspends it in %.0f s)", left)) : "",
+                        inPiP ? "on" : "off", Double(lastDone - beatDone) / (now - beatAt) / 1e6, now - beatAt, Double(lastDone) / 1e6))
+        beatDone = lastDone; beatAt = now
+    }
+
     fileprivate func render() {
+        if running { heartbeat() }
         guard running, let pb = Self.frame(title: title, fraction: fraction, line1: line1, line2: line2) else { return }
         var fmt: CMVideoFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pb, formatDescriptionOut: &fmt)
