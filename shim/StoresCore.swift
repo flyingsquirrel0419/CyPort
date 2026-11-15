@@ -1,7 +1,8 @@
 // Store downloads: sign in to Steam, GOG or Epic and download the Mac version of Cyberpunk 2077's game data
 // (archive, engine, r6) straight into the app - only when the account owns the game (each store refuses the
 // download otherwise). The executable is not downloaded: iOS only runs code that was signed into the app, so it
-// still comes from the Mac build (build.sh).
+// still comes from the Mac build (build.sh). The Mac download tool (tools/steam_download) uses the same code to download the
+// arm64 Mac program itself (GameFiles.Scope.program / .all) for build.sh.
 //
 // Written for CyPort. The store protocols were worked out from the stores' public behaviour and from how other
 // open clients (legendary, heroic-gogdl, SteamKit, playport) talk to them; no code is copied from them.
@@ -166,7 +167,7 @@ final class NetMeter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 enum Net {
     static let session: URLSession = {
         let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 16; c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.timeoutIntervalForRequest = 20; c.httpMaximumConnectionsPerHost = 16; c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
         return URLSession(configuration: c, delegate: NetMeter.shared, delegateQueue: nil)
     }()
@@ -203,7 +204,21 @@ enum Net {
 
 enum Keychain {
     static let service = "cyport.stores"
+    /// Mac download tool: a JSON file (mode 0600) instead of the Keychain - an unsigned command line tool can't rely
+    /// on the data-protection keychain. nil (the app): the Keychain.
+    static var fileURL: URL?
+    private static func fileItems() -> [String: Any] {
+        guard let u = fileURL, let d = try? Data(contentsOf: u) else { return [:] }
+        return (try? JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
+    }
+    private static func writeFile(_ items: [String: Any]) {
+        guard let u = fileURL, let d = try? JSONSerialization.data(withJSONObject: items) else { return }
+        try? FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        _ = FileManager.default.createFile(atPath: u.path, contents: d, attributes: [.posixPermissions: 0o600])
+    }
     static func save(_ key: String, _ value: [String: Any]) {
+        if fileURL != nil { var all = fileItems(); all[key] = value; writeFile(all); return }
         guard let d = try? JSONSerialization.data(withJSONObject: value) else { return }
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: key]
         SecItemDelete(q as CFDictionary)
@@ -211,6 +226,7 @@ enum Keychain {
         SecItemAdd(add as CFDictionary, nil)
     }
     static func load(_ key: String) -> [String: Any]? {
+        if fileURL != nil { return fileItems()[key] as? [String: Any] }
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: key,
                                 kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var out: CFTypeRef?
@@ -218,6 +234,7 @@ enum Keychain {
         return try? JSONSerialization.jsonObject(with: d) as? [String: Any]
     }
     static func delete(_ key: String) {
+        if fileURL != nil { var all = fileItems(); all[key] = nil; writeFile(all); return }
         SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: key] as CFDictionary)
     }
 }
@@ -236,36 +253,73 @@ struct DLPlan {
     var version: String                 /// identifies this build (resume journal)
     var versionName: String             /// the game version as the store names it ("2.31a_mac"), for the screen
     var fetch: @Sendable (Int) async throws -> Data
+    /// symbolic links in the download (path -> target), relative to the game folder; the app never needs them, the Mac
+    /// download tool (tools/steam_download) creates them inside Cyberpunk2077.app
+    var links: [String: String] = [:]
     var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
 }
 
 enum GameFiles {
     static let dataDirs = ["archive", "engine", "r6"]
-    /// Keep only the game's data folders (the Mac app bundle with the executable is skipped) and make their paths
-    /// relative to the game folder, wherever the store puts it.
-    static func pick(_ files: [DLFile]) throws -> [DLFile] {
+    static let appBundle = "cyberpunk2077.app"
+    /// what a download keeps: the data folders (the app: its program comes from build.sh), only the Mac program
+    /// (Cyberpunk2077.app, for build.sh), or the whole game folder
+    enum Scope { case data, program, all }
+
+    /// the folder inside the store's download that holds the game (wherever the store puts it), lowercased
+    static func root(_ paths: [String]) -> String? {
         var prefix: String?
-        for f in files {
-            let l = f.path.lowercased()
-            guard let r = l.range(of: "r6/") else { continue }
-            let p = String(l[..<r.lowerBound])
-            guard p.isEmpty || p.hasSuffix("/") else { continue }
-            if prefix == nil || p.count < prefix!.count { prefix = p }
+        for l in paths.map({ $0.lowercased() }) {
+            for marker in ["r6/", appBundle + "/"] {
+                guard let r = l.range(of: marker) else { continue }
+                let p = String(l[..<r.lowerBound])
+                guard p.isEmpty || p.hasSuffix("/") else { continue }
+                if prefix == nil || p.count < prefix!.count { prefix = p }
+            }
         }
-        guard let pre = prefix else { throw StoreError("This download doesn't contain the game's data folders (archive, engine, r6).") }
+        return prefix
+    }
+    /// `path` relative to the game folder, if `scope` keeps it
+    static func relative(_ path: String, root pre: String, scope: Scope) -> String? {
+        guard path.lowercased().hasPrefix(pre) else { return nil }
+        let rel = String(path.dropFirst(pre.count))
+        guard let top = rel.split(separator: "/").first, rel.contains("/") else { return nil }
+        guard !rel.split(separator: "/").contains(where: { $0 == ".." || $0 == "." }) else { return nil }
+        switch scope {
+        case .data: guard dataDirs.contains(top.lowercased()) else { return nil }
+        case .program: guard top.lowercased() == appBundle else { return nil }
+        case .all: break
+        }
+        return rel
+    }
+    /// Keep the files `scope` asks for (by default only the game's data folders: the Mac app bundle with the
+    /// executable is skipped) and make their paths relative to the game folder, wherever the store puts it.
+    static func pick(_ files: [DLFile], scope: Scope = .data) throws -> [DLFile] {
+        let what = scope == .program ? "the Mac program (Cyberpunk2077.app)" : "the game's data folders (archive, engine, r6)"
+        guard let pre = root(files.map(\.path)) else { throw StoreError("This download doesn't contain \(what).") }
         var byPath: [String: DLFile] = [:], order: [String] = []
         for var f in files {
-            let l = f.path.lowercased()
-            guard l.hasPrefix(pre) else { continue }
-            let rel = String(f.path.dropFirst(pre.count))
-            guard let top = rel.split(separator: "/").first, dataDirs.contains(top.lowercased()), rel.contains("/") else { continue }
-            guard !rel.split(separator: "/").contains(where: { $0 == ".." || $0 == "." }) else { continue }
+            guard let rel = relative(f.path, root: pre, scope: scope) else { continue }
             f.path = rel
             if byPath[rel.lowercased()] == nil { order.append(rel.lowercased()) }
             byPath[rel.lowercased()] = f                         // a later depot (DLC, language) wins
         }
         let out = order.compactMap { byPath[$0] }
-        guard !out.isEmpty else { throw StoreError("This download doesn't contain the game's data folders.") }
+        guard !out.isEmpty else { throw StoreError("This download doesn't contain \(what).") }
+        if scope != .data && !out.contains(where: { $0.path.lowercased() == appBundle + "/contents/macos/cyberpunk2077" }) {
+            throw StoreError("This download has no Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077.")
+        }
+        return out
+    }
+    /// the symbolic links `scope` keeps, relative to the game folder (same root as the files)
+    static func pickLinks(_ links: [(path: String, target: String)], files: [DLFile], scope: Scope) -> [String: String] {
+        guard scope != .data, let pre = root(files.map(\.path) + links.map(\.path)) else { return [:] }
+        var out: [String: String] = [:]
+        for l in links {
+            guard let rel = relative(l.path, root: pre, scope: scope) else { continue }
+            guard !l.target.hasPrefix("/") else { continue }                 // only links that stay inside the game
+            out[rel] = l.target
+        }
         return out
     }
 }
@@ -278,7 +332,20 @@ final class Downloader: @unchecked Sendable {
     private func setLive(_ d: Int64, _ f: String?) { lock.lock(); liveDone = d; if let f { liveFile = f }; lock.unlock() }
     private func live() -> (Int64, String) { lock.lock(); defer { lock.unlock() }; return (liveDone, liveFile) }
     let plan: DLPlan, dest: URL
-    var parallel = 8
+    /// how far ahead of the file being written chunks are fetched: up to this many requests, up to this many bytes
+    /// (a slow chunk then doesn't drain the pipe - the others keep coming; was 8 chunks, too few for fast lines)
+    /// requests at once: tuned while it runs (see `tune`). Steam's caches took 3-20 s per 1 MB chunk of the Mac game
+    /// data; 47 at once gave 1.5-2.7 MB/s, 128 at once less (timeouts, lost connections - a home router or the line
+    /// doesn't like that many), the game program 10 MB/s with the same settings (macshim.log, 2026-11-15)
+    /// Until v1.4-steam.11 "requests at once" also counted chunks that had arrived and were only waiting for their turn
+    /// to be written, so one slow chunk (Fastly: 6-17 s) stopped new requests and only ~6 were really on the network.
+    /// Now it counts requests on the network only, and a chunk the writer waits on too long is asked for again from
+    /// another server (whichever answers first wins).
+    var parallel = 24
+    let minParallel = 8, maxParallel = 64
+    var aheadLimit = 256 << 20
+    /// the writer waits on a chunk this long (from when it was requested) before asking another server for it too
+    let hedgeAfter = 4.0
     private let journalURL: URL
     private var journal: [String: Int64] = [:]           // path -> bytes known good (complete files: their size)
     private let lock = NSLock()
@@ -326,14 +393,22 @@ final class Downloader: @unchecked Sendable {
         var queue: [(file: Int, part: Int)] = []
         for s in starts { for p in s.part..<plan.files[s.file].parts.count { queue.append((s.file, p)) } }
         var ahead = 0                                       // next queue index to start fetching
+        var aheadBytes = 0                                  // bytes of the parts in queue[qi..<ahead]
+        let onNet = Gauge()                                 // requests on the network now (not ones that arrived)
+        var started: [Int: Double] = [:]
+        func start(_ c: Int) -> Task<Data, Error> {
+            onNet.add(1); started[c] = CFAbsoluteTimeGetCurrent()
+            return Task { defer { onNet.add(-1) }; return try await fetch(c) }
+        }
         func pump() {
-            while ahead < queue.count && inflight.count < parallel {
-                let c = plan.files[queue[ahead].file].parts[queue[ahead].part].chunk
-                ahead += 1
+            while ahead < queue.count && onNet.value < parallel && aheadBytes < aheadLimit {
+                let pa = plan.files[queue[ahead].file].parts[queue[ahead].part], c = pa.chunk
+                ahead += 1; aheadBytes += pa.length
                 if cache[c] != nil || inflight[c] != nil { continue }
-                inflight[c] = Task { try await fetch(c) }
+                inflight[c] = start(c)
             }
         }
+        var hedged = 0, hedgeWon = 0
         var lastSave = Date()
         setLive(done, nil)
         // the screen: 4 updates a second; speed = network bytes over the last 3 s, time left from that speed
@@ -355,6 +430,21 @@ final class Downloader: @unchecked Sendable {
         var current: FileHandle?, currentFile = -1, fileWritten: Int64 = 0
         defer { try? current?.close() }
         var qi = 0
+        var waited = 0.0, statFrom = CFAbsoluteTimeGetCurrent(), statDone = done      // for the log: network or disk?
+        // hill climbing on the network rate every 15 s: keep going the way that made it faster, turn round otherwise
+        var tuneAt = CFAbsoluteTimeGetCurrent(), tuneNet = NetMeter.shared.snapshot.total, lastRate = 0.0, dir = 1
+        func tune() {
+            let now = CFAbsoluteTimeGetCurrent()
+            guard now - tuneAt >= 15 else { return }
+            let net = NetMeter.shared.snapshot.total
+            let rate = Double(net - tuneNet) / (now - tuneAt)
+            if lastRate > 0 && rate < lastRate * 1.05 { dir = -dir }
+            let was = parallel
+            parallel = min(maxParallel, max(minParallel, parallel + dir * 8))
+            storeLog(String(format: "download: %.2f MB/s from the network with %d requests at once -> %d (%d slow chunks asked again, %d of them came first)",
+                            rate / 1e6, was, parallel, hedged, hedgeWon))
+            lastRate = rate; tuneAt = now; tuneNet = net
+        }
         // files that already finished (or are empty) still need to exist
         for s in starts where plan.files[s.file].parts.isEmpty || s.part == plan.files[s.file].parts.count {
             let u = dest.appendingPathComponent(plan.files[s.file].path)
@@ -363,6 +453,7 @@ final class Downloader: @unchecked Sendable {
         }
         while qi < queue.count {
             try Task.checkCancellation()
+            tune()
             pump()
             let (fi, pi) = queue[qi]; let f = plan.files[fi], part = f.parts[pi]
             if fi != currentFile {
@@ -378,9 +469,23 @@ final class Downloader: @unchecked Sendable {
             let data: Data
             if let d = cache[part.chunk] { data = d }
             else {
-                let t = inflight[part.chunk] ?? Task { try await fetch(part.chunk) }
-                inflight[part.chunk] = nil
-                data = try await t.value
+                let c = part.chunk
+                let t = inflight[c] ?? start(c)
+                inflight[c] = nil
+                let w0 = CFAbsoluteTimeGetCurrent()
+                let wait = max(0.05, hedgeAfter - (w0 - (started[c] ?? w0)))
+                switch await Self.first(t, within: wait) {
+                case .some(.success(let d)): data = d
+                case .some(.failure(let e)): throw e
+                case .none:                                 // still not here: another server too, the first answer wins
+                    hedged += 1
+                    let t2 = start(c)
+                    let (d, second) = try await Self.race(t, t2)
+                    if second { hedgeWon += 1 }
+                    data = d
+                }
+                started[c] = nil
+                waited += CFAbsoluteTimeGetCurrent() - w0
             }
             uses[part.chunk] -= 1
             if uses[part.chunk] > 0 { cache[part.chunk] = data } else { cache[part.chunk] = nil }
@@ -388,6 +493,7 @@ final class Downloader: @unchecked Sendable {
             do { try current!.write(contentsOf: data.subdata(in: part.offset..<(part.offset + part.length))) }
             catch { throw StoreError("Writing \(f.path) failed: \(error.localizedDescription). Is the storage full?") }
             done += Int64(part.length)
+            if qi < ahead { aheadBytes -= part.length }
             setLive(done, f.path)
             fileWritten += Int64(part.length)
             setJournal(f.path, fileWritten)
@@ -395,14 +501,51 @@ final class Downloader: @unchecked Sendable {
             qi += 1
             let now = Date()
             if now.timeIntervalSince(lastSave) > 5 { try current?.synchronize(); saveJournal(); lastSave = now }
+            let tn = CFAbsoluteTimeGetCurrent()
+            if tn - statFrom > 20 {
+                storeLog(String(format: "download: %.2f MB/s written, %.0f%% of the time waiting for the network, %d requests on the network, %d chunks arrived early, %.0f MB ahead",
+                                Double(done - statDone) / (tn - statFrom) / 1e6, waited / (tn - statFrom) * 100, onNet.value, inflight.count, Double(aheadBytes) / 1e6))
+                statFrom = tn; statDone = done; waited = 0
+            }
             // keep the decoded-chunk cache bounded (Epic chunks can be shared between far-apart files)
             if cache.count > 256 { for k in cache.keys.prefix(cache.count - 192) { cache[k] = nil } }
         }
         try? fm.removeItem(at: journalURL)
+        for t in inflight.values { t.cancel() }
         ticker.cancel()
         progress(Progress(done: total, total: total, bytesPerSecond: 0, secondsLeft: 0, file: ""))
         storeLog("download complete")
     }
+}
+
+extension Downloader {
+    /// the task's result if it finishes within `seconds`, nil if not (the task keeps going)
+    static func first(_ t: Task<Data, Error>, within seconds: Double) async -> Result<Data, Error>? {
+        await withTaskGroup(of: Result<Data, Error>?.self) { g in
+            g.addTask { do { return .success(try await t.value) } catch { return .failure(error) } }
+            g.addTask { try? await Task.sleep(nanoseconds: UInt64(seconds * 1e9)); return nil }
+            let r = await g.next()!
+            g.cancelAll()
+            return r
+        }
+    }
+    /// the first of two requests for the same chunk to succeed (the other is cancelled); fails only if both fail.
+    /// `second`: the later request won
+    static func race(_ a: Task<Data, Error>, _ b: Task<Data, Error>) async throws -> (Data, second: Bool) {
+        try await withThrowingTaskGroup(of: (Data, Bool)?.self) { g in
+            g.addTask { (try? await a.value).map { ($0, false) } }
+            g.addTask { (try? await b.value).map { ($0, true) } }
+            for try await r in g { if let r { g.cancelAll(); (r.1 ? a : b).cancel(); return r } }
+            _ = try await a.value                       // both failed: throw the first one's error
+            throw StoreError("chunk failed")
+        }
+    }
+}
+
+final class Gauge: @unchecked Sendable {
+    private var n = 0; private let l = NSLock()
+    func add(_ d: Int) { l.lock(); n += d; l.unlock() }
+    var value: Int { l.lock(); defer { l.unlock() }; return n }
 }
 
 // MARK: - minimal protobuf (Steam)
@@ -603,25 +746,35 @@ actor SteamCM {
         var d = Data(); d.appendLE(e.rawValue | 0x80000000); d.appendLE(UInt32(h.data.count)); d.append(h.data); d.append(body.data)
         try await ws.send(.data(d))
     }
+    private var jobNames: [UInt64: String] = [:]
     private func waitJob(_ job: UInt64, timeout: Double) async throws -> Packet {
         if var q = jobQueue[job], !q.isEmpty { let p = q.removeFirst(); jobQueue[job] = q; return p }
         if let failure { throw failure }
-        let timer = Task { try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9)); self.timeoutJob(job) }
+        let timer = Task { do { try await Task.sleep(nanoseconds: UInt64(timeout * 1e9)) } catch { return }; self.timeoutJob(job) }   // answered in time: not a timeout
         defer { timer.cancel() }
         return try await withCheckedThrowingContinuation { jobWaiters[job] = $0 }
     }
-    private func timeoutJob(_ job: UInt64) { jobWaiters.removeValue(forKey: job)?.resume(throwing: StoreError("Steam didn't answer in time")) }
+    private func timeoutJob(_ job: UInt64) {
+        guard let c = jobWaiters.removeValue(forKey: job) else { return }
+        let what = jobNames[job] ?? "request"
+        storeLog("steam: no answer to \(what) (job \(job))")
+        c.resume(throwing: StoreError("Steam didn't answer in time (\(what))"))
+    }
     private func waitEMsg(_ e: EMsg, timeout: Double) async throws -> Packet {
         if let failure { throw failure }
-        let timer = Task { try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9)); self.timeoutEMsg(e.rawValue) }
+        let timer = Task { do { try await Task.sleep(nanoseconds: UInt64(timeout * 1e9)) } catch { return }; self.timeoutEMsg(e.rawValue) }
         defer { timer.cancel() }
         return try await withCheckedThrowingContinuation { emsgWaiters[e.rawValue] = $0 }
     }
-    private func timeoutEMsg(_ e: UInt32) { emsgWaiters.removeValue(forKey: e)?.resume(throwing: StoreError("Steam didn't answer in time")) }
+    private func timeoutEMsg(_ e: UInt32) {
+        guard let c = emsgWaiters.removeValue(forKey: e) else { return }
+        storeLog("steam: no answer to message \(e)")
+        c.resume(throwing: StoreError("Steam didn't answer in time (message \(e))"))
+    }
 
     /// a request answered with a job reply (the reply's header names our job)
     func call(_ e: EMsg, _ body: PBWriter, timeout: Double = 30) async throws -> Packet {
-        let job = nextJob; nextJob += 1
+        let job = nextJob; nextJob += 1; jobNames[job] = "\(e)"
         try await send(e, body, job: job)
         return try await waitJob(job, timeout: timeout)
     }
@@ -634,7 +787,7 @@ actor SteamCM {
     }
     /// a unified service method ("Authentication.X#1"); returns the reply body or throws Steam's result
     func service(_ method: String, _ body: PBWriter, authed: Bool, timeout: Double = 30) async throws -> PBMessage {
-        let job = nextJob; nextJob += 1
+        let job = nextJob; nextJob += 1; jobNames[job] = method
         try await send(authed ? .serviceMethodCallFromClient : .serviceMethodCallFromClientNonAuthed, body, job: job, target: method,
                        steamID: authed ? nil : 0, session: authed ? nil : 0)
         let p = try await waitJob(job, timeout: timeout)
@@ -800,6 +953,28 @@ final class SteamStore: @unchecked Sendable {
 
     /// the app's Mac depots (base game, owned DLC, English) from Steam's app info
     func macDepots(app: UInt32 = Game.steamApp) async throws -> (depots: [Depot], buildID: String) {
+        let info = try await appInfo(app)
+        guard let depots = info["depots"] else { throw StoreError("Steam app info has no depots") }
+        return try macDepots(depots)
+    }
+
+    /// where Steam Cloud keeps Cyberpunk's saves, from the app info (ufs > savefiles: root + path), e.g.
+    /// "%WinSavedGames%CD Projekt Red/Cyberpunk 2077/" - for a first upload when Steam Cloud has no saves to copy it from
+    func cloudSavePrefix(app: UInt32 = Game.steamApp) async -> String {
+        let fallback = "%WinSavedGames%CD Projekt Red/Cyberpunk 2077/"
+        guard let info = try? await appInfo(app), let sf = info["ufs"]?["savefiles"] else { return fallback }
+        for (_, e) in sf.children {
+            guard let root = e["root"]?.string, var path = e["path"]?.string, path.contains("Cyberpunk") else { continue }
+            if root.lowercased().hasPrefix("mac") || root.lowercased().hasPrefix("linux") { continue }   // the Windows (canonical) entry
+            path = path.replacingOccurrences(of: "\\", with: "/")
+            if !path.hasSuffix("/") { path += "/" }
+            return "%\(root)%\(path)"
+        }
+        return fallback
+    }
+
+    /// the app's info (KeyValues) from Steam (PICS)
+    func appInfo(_ app: UInt32) async throws -> KV {
         if !loggedOn { try await logOn() }
         var tq = PBWriter(); tq.u(2, UInt64(app))
         let tr = try PBMessage(try await cm.call(.picsAccessTokenRequest, tq).body)
@@ -816,8 +991,10 @@ final class SteamStore: @unchecked Sendable {
         }
         guard let buf = buffer else { throw StoreError("Steam sent no app info for Cyberpunk 2077") }
         let root = KV.parse(String(decoding: buf, as: UTF8.self))
-        let info = root["appinfo"] ?? root.children.first?.1 ?? root
-        guard let depots = info["depots"] else { throw StoreError("Steam app info has no depots") }
+        return root["appinfo"] ?? root.children.first?.1 ?? root
+    }
+
+    private func macDepots(_ depots: KV) throws -> (depots: [Depot], buildID: String) {
         let build = depots["branches"]?["public"]?["buildid"]?.string ?? "?"
         var out: [Depot] = []
         for (k, d) in depots.children {
@@ -826,6 +1003,9 @@ final class SteamStore: @unchecked Sendable {
             let os = (cfg?["oslist"]?.string ?? "").lowercased()
             let lang = (cfg?["language"]?.string ?? "").lowercased()
             guard os.split(separator: ",").contains("macos") else { continue }
+            // Apple Silicon only: skip depots Steam marks as 32-bit (osarch "32"); "64", "arm64" or none are fine
+            let arch = (cfg?["osarch"]?.string ?? "").lowercased()
+            guard arch.isEmpty || arch == "64" || arch == "arm64" else { continue }
             guard lang.isEmpty || lang == "english" else { continue }
             guard d["depotfromapp"] == nil else { continue }
             guard (cfg?["lowviolence"]?.string ?? "0") != "1" else { continue }
@@ -847,6 +1027,8 @@ final class SteamStore: @unchecked Sendable {
             let m = try PBMessage(x)
             let type = m.s(1) ?? "", https = m.s(12) ?? ""
             guard type == "SteamCache" || type == "CDN", https != "unavailable", let v = m.s(9) ?? m.s(8) else { continue }
+            // proxies need their own request path, China-only servers don't serve other regions well
+            if (m.u(10) ?? 0) != 0 || (m.u(7) ?? 0) != 0 { continue }
             if let allowed = m.fields[13], !allowed.isEmpty {
                 let ids = allowed.compactMap { if case .varint(let v) = $0 { return v }; return nil }
                 if !ids.isEmpty && !ids.contains(UInt64(Game.steamApp)) { continue }
@@ -855,16 +1037,19 @@ final class SteamStore: @unchecked Sendable {
         }
         out.sort { ($0.1, $0.2) < ($1.1, $1.2) }
         guard !out.isEmpty else { throw StoreError("Steam gave no download server") }
+        storeLog("steam: cell \(await cm.cellID), servers: " + out.prefix(10).map { "\($0.0.host) (load \($0.2))" }.joined(separator: ", "))
         return out.map(\.0)
     }
 
-    /// the whole download: every owned Mac depot's files, chunk by chunk
-    func plan(progress: @escaping (String) -> Void) async throws -> DLPlan {
+    /// the whole download: every owned Mac depot's files, chunk by chunk (`scope`: the app takes only the data
+    /// folders, the Mac download tool also the arm64 program, Cyberpunk2077.app)
+    func plan(scope: GameFiles.Scope = .data, progress: @escaping (String) -> Void) async throws -> DLPlan {
         let (depots, build) = try await macDepots()
         let servers = try await servers()
         storeLog("steam: \(servers.count) download servers")
         struct ChunkRef { let depot: UInt32; let sha: Data; let crc: UInt32; let size: Int; let csize: Int }
         var chunks: [ChunkRef] = [], index: [Data: Int] = [:], files: [DLFile] = [], keys: [UInt32: Data] = [:]
+        var links: [(path: String, target: String)] = []
         var ownedAny = false
         for d in depots {
             progress("Reading Steam depot \(d.id)…")
@@ -886,6 +1071,7 @@ final class SteamStore: @unchecked Sendable {
             }
             guard let raw = manifest else { throw last }
             for f in try Self.parseManifest(raw, key: key) {
+                if let t = f.link { links.append((f.path, t)); continue }
                 var parts: [DLPart] = []
                 for c in f.chunks.sorted(by: { $0.offset < $1.offset }) {
                     let k: Int
@@ -900,26 +1086,37 @@ final class SteamStore: @unchecked Sendable {
             }
         }
         guard ownedAny else { throw StoreError("This Steam account doesn't own Cyberpunk 2077 (Steam refused the download key).") }
-        let picked = try GameFiles.pick(files)
+        let picked = try GameFiles.pick(files, scope: scope)
+        let pickedLinks = GameFiles.pickLinks(links, files: files, scope: scope)
         let refs = chunks, ks = keys, hosts = servers.map(\.host)
-        let counter = Counter()
-        return DLPlan(files: picked, chunkCount: refs.count, version: "steam-\(build)", versionName: "Steam build \(build)", fetch: { i in
+        let pool = HostPool(hosts)
+        return DLPlan(files: picked, chunkCount: refs.count, version: scope == .data ? "steam-\(build)" : "steam-\(build)-\(scope)", versionName: "Steam build \(build)", fetch: { i in
             let c = refs[i]; var last: Error = StoreError("chunk")
             for attempt in 0..<6 {
-                let host = hosts[(counter.next() + attempt) % hosts.count]
+                let host = pool.take()
+                let t0 = CFAbsoluteTimeGetCurrent()
+                var answered = false                                       // the server's part is over (done() was called)
                 do {
                     let enc = try await Net.request(URL(string: "https://\(host)/depot/\(c.depot)/chunk/\(c.sha.hex)")!, tries: 1)
+                    pool.done(host, bytes: enc.count, seconds: CFAbsoluteTimeGetCurrent() - t0); answered = true
                     let plain = try Self.decodeChunk(enc, key: ks[c.depot]!, size: c.size)
                     guard Hash.steamAdler(plain) == c.crc else { throw StoreError("chunk checksum mismatch") }
                     return plain
-                } catch is CancellationError { throw CancellationError() } catch { last = error }
-                try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                } catch {
+                    // cancelled: another server answered first for this chunk (not this server's fault)
+                    if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                        if !answered { pool.release(host) }
+                        throw CancellationError()
+                    }
+                    if answered { last = error } else { pool.failed(host, error); last = error }
+                }
+                if attempt > 0 { try await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000) }
             }
             throw last
-        })
+        }, links: pickedLinks)
     }
 
-    struct MFile { let path: String; let size: Int64; let chunks: [(sha: Data, crc: UInt32, offset: UInt64, size: Int, csize: Int)] }
+    struct MFile { let path: String; let size: Int64; let chunks: [(sha: Data, crc: UInt32, offset: UInt64, size: Int, csize: Int)]; var link: String? = nil }
     static func parseManifest(_ d: Data, key: Data) throws -> [MFile] {
         var at = 0, payload: Data?, encrypted = false
         while at + 8 <= d.count {
@@ -942,8 +1139,14 @@ final class SteamStore: @unchecked Sendable {
                 name = String(decoding: try AES.steamDecrypt(raw, key: key), as: UTF8.self)
                 while name.hasSuffix("\0") { name.removeLast() }
             }
-            if f.s(7).map({ !$0.isEmpty }) ?? false { continue }           // symlink
             name = name.replacingOccurrences(of: "\\", with: "/")
+            if let t = f.s(7), !t.isEmpty {                                // symlink (inside the Mac app bundle)
+                var target = t
+                if encrypted, let raw = Data(base64Encoded: t.filter { !$0.isWhitespace }), let plain = try? AES.steamDecrypt(raw, key: key) {
+                    target = String(decoding: plain, as: UTF8.self); while target.hasSuffix("\0") { target.removeLast() }
+                }
+                out.append(MFile(path: name, size: 0, chunks: [], link: target.replacingOccurrences(of: "\\", with: "/"))); continue
+            }
             var cs: [(Data, UInt32, UInt64, Int, Int)] = []
             for c in f.all(6) {
                 let cm = try PBMessage(c)
@@ -977,6 +1180,62 @@ final class SteamStore: @unchecked Sendable {
         }
         if h == [0x50, 0x4B, 0x03, 0x04] { return try Zip.firstEntry(Data(b)) }
         throw StoreError("unknown chunk format")
+    }
+}
+
+/// Steam download servers: each chunk goes to the healthy server with the fewest requests still running (a slow
+/// server keeps its requests longer, so it gets fewer new ones - the fast ones end up doing most of the work).
+/// A server that fails twice in a row sits out 30 s. Logs what each server did every 20 s (macshim.log).
+final class HostPool: @unchecked Sendable {
+    private struct H { let name: String; var running = 0, fails = 0, ok = 0, bytes = 0, seconds = 0.0, errors = 0; var outUntil = 0.0; var lastError = ""
+        var recent = 0.0                                                   // seconds per chunk lately (0: not known yet)
+        /// when a new request here would be expected to finish: slow servers (Fastly took 6-17 s a chunk when the
+        /// others took 1-4 s) get fewer requests, not the same number
+        var cost: Double { Double(running + 1) * (recent > 0 ? recent : 1.5) }
+    }
+    private var hs: [H]
+    private let l = NSLock()
+    private var lastLog = CFAbsoluteTimeGetCurrent()
+    init(_ hosts: [String]) { hs = hosts.prefix(8).map { H(name: $0) } }
+    func take() -> String {
+        l.lock(); defer { l.unlock() }
+        let now = CFAbsoluteTimeGetCurrent()
+        var best = -1
+        for i in hs.indices where hs[i].outUntil <= now {
+            // soonest expected answer wins; on a tie the server Steam ranked higher (earlier) wins
+            if best < 0 || hs[i].cost < hs[best].cost { best = i }
+        }
+        if best < 0 { best = hs.indices.min { hs[$0].outUntil < hs[$1].outUntil }! }
+        hs[best].running += 1
+        return hs[best].name
+    }
+    private func index(_ h: String) -> Int? { hs.firstIndex { $0.name == h } }
+    func release(_ h: String) { l.lock(); if let i = index(h) { hs[i].running -= 1 }; l.unlock() }
+    func done(_ h: String, bytes: Int, seconds: Double) {
+        l.lock()
+        if let i = index(h) { hs[i].running -= 1; hs[i].fails = 0; hs[i].ok += 1; hs[i].bytes += bytes; hs[i].seconds += seconds
+            hs[i].recent = hs[i].recent > 0 ? hs[i].recent * 0.8 + seconds * 0.2 : seconds }
+        let now = CFAbsoluteTimeGetCurrent(), report = now - lastLog > 20
+        if report { lastLog = now }
+        let lines = report ? hs.filter { $0.ok + $0.errors > 0 }.map {
+            String(format: "%@ %d ok %.0f MB, %.0f ms/chunk (lately %.0f), %.2f MB/s per request, %d errors%@", $0.name, $0.ok, Double($0.bytes) / 1e6,
+                   $0.ok > 0 ? $0.seconds / Double($0.ok) * 1000 : 0, $0.recent * 1000, $0.seconds > 0 ? Double($0.bytes) / $0.seconds / 1e6 : 0,
+                   $0.errors, $0.lastError.isEmpty ? "" : " (last: \($0.lastError))")
+        } : []
+        l.unlock()
+        if report { storeLog("download servers: " + lines.joined(separator: " | ")) }
+    }
+    func failed(_ h: String, _ e: Error) {
+        l.lock()
+        var first = false
+        if let i = index(h) {
+            hs[i].running -= 1; hs[i].fails += 1; hs[i].errors += 1; first = hs[i].errors <= 3
+            hs[i].recent = max(hs[i].recent, 1.5) * 1.5
+            hs[i].lastError = e.localizedDescription
+            if hs[i].fails >= 2 { hs[i].outUntil = CFAbsoluteTimeGetCurrent() + 30; hs[i].fails = 0 }
+        }
+        l.unlock()
+        if first { storeLog("download server \(h): \(e.localizedDescription)") }
     }
 }
 

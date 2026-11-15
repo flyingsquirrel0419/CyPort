@@ -27,6 +27,7 @@ No emulation, no streaming: the Apple Silicon Mac build runs directly on iOS / i
 | Performance | ⚠️ ~30 FPS in the open world at 1434 × 660 with low settings + MetalFX on an iPhone 16 Pro Max (more indoors); v1.2 keeps the phone cooler for longer, but it still throttles in long sessions – see [Performance tips](#performance-tips) |
 | Cloud saves (GOG, Steam, Epic) – carry on where you left off on your PC/Mac and back | 🧪 new: GOG download tested, sending and Steam/Epic untested |
 | Download the game data in the app (Steam, GOG, Epic account) | 🧪 new: untested with signed-in accounts |
+| **No Mac:** IPA from GitHub Actions; the phone downloads the game program from Steam, converts it and makes the IPA to install | 🧪 new: untested on a device ([No Mac](#no-mac-github-actions--steam-on-the-phone)) |
 | Online features (GOG Galaxy achievements, crash upload) | ❌ offline only (stubbed) |
 
 Tested on: **iPhone 16 Pro Max (A18 Pro, 8 GB), iOS 27.0.1**, built with Xcode 27; **iPhone Duo (12 GB), iOS 27.1**, built with Xcode 27.1.
@@ -55,6 +56,9 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 ### To build it
 - A **Mac** with **Xcode 16 or newer** (Xcode 27 tested) and Python 3.
 - **Cyberpunk 2077 for Mac from GOG, version 2.3.1**, downloaded on that Mac (the `Cyberpunk 2077` folder with `Cyberpunk2077.app`, `archive`, `engine`, `r6`).
+  - **Or let the build download it from Steam:** `STEAM_USER=<your Steam account> ./build.sh` signs in to Steam (password +
+    Steam Guard) and downloads the arm64 Mac `Cyberpunk2077.app` from the account that owns the game – see
+    [Download the game from Steam](#download-the-game-from-steam).
   - **Steam version 2.5.0** (Mac): launches and plays (tested on an iPhone Duo, game data copied over USB). The mouse gate
     address is picked per build, and the build check now fails if the game needs an AppKit symbol the shim doesn't provide.
   - Epic / Mac App Store copies: **untested**. The game data is probably the same for the same version, but CyPort's patches
@@ -69,6 +73,8 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
 ---
 
 ## Install
+
+Two ways: **with a Mac** (below), or **without one** – see [No Mac](#no-mac-github-actions--steam-on-the-phone).
 
 1. **Developer portal** (developer.apple.com → Certificates, Identifiers & Profiles):
    create an App ID (e.g. `com.yourname.cyport`) with the capabilities **Extended Virtual Address Space** and
@@ -85,6 +91,8 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
    ./build.sh
    ```
    This writes `build/CyPort.ipa` and installs it on the connected device (`DEVICE=`).
+   No game on the Mac? Replace `GAME_APP=…` with `STEAM_USER=<your Steam account>` to download it from Steam first
+   (see [Download the game from Steam](#download-the-game-from-steam)).
    Without `SIGN_ID` you get `build/CyPort-unsigned.ipa` for SideStore / AltStore / Sideloadly / LiveContainer (see *Free Apple ID* below).
    Or double-click **`Build CyPort.command`** and drag your `Cyberpunk2077.app` into the window (then sign the IPA yourself).
 3. **Import the game data** on the device: open CyPort → **Import game…** → pick your `Cyberpunk 2077` folder
@@ -93,6 +101,49 @@ M-series iPads have more RAM and better cooling and should run it as well or bet
    **Download from Steam, GOG or Epic…**, sign in with the account that owns the game and let CyPort download the game data
    (only the data folders; the program itself always comes from your build).
 4. Open CyPort, pick a resolution, press **PLAY**.
+
+### No Mac (GitHub Actions + Steam on the phone)
+GitHub Actions (`.github/workflows/build.yml`) builds CyPort **without the game**: `NO_GAME=1 ./build.sh` →
+`CyPort-unsigned.ipa` (the workflow's artifact; on a `v*` tag also a release). It contains no game files.
+1. Install `CyPort-unsigned.ipa` with SideStore / AltStore / LiveContainer (free Apple ID: also the GetMoreRam steps below).
+2. Open it: the setup screen. Choose where the game program comes from:
+   - **Steam** – sign in with the account that owns Cyberpunk 2077 (password + Steam Guard, as in the in-app download)
+     → **Get the game** → **Download**: CyPort downloads only the Mac game program (`Cyberpunk2077.app`, Apple Silicon).
+   - **Your own copy** (CyPort's original way) – **Pick the game…**: the Mac version's `Cyberpunk2077.app` (or the game
+     folder holding it) in Files, on the phone, iCloud Drive or a USB drive → **Convert**.
+
+   Either way CyPort converts it for iOS on the phone (`shim/MachORetarget.swift` – the same changes as
+   `tools/ios_retarget.py --game-folder`, byte for byte: `tools/test_retarget.sh`) and writes `CyPort-<version>.ipa`
+   (also in *Files → On My iPhone → CyPort*).
+3. **Game data**: the next step downloads it (Steam, GOG or Epic) into CyPort's files right away – or **Later**, after
+   installing. It stays when the app is installed over.
+4. **Install…** → choose SideStore (or LiveContainer, AltStore, TrollStore) and install it **over** the first one. iOS only
+   runs code signed into an installed app, so this step can't be skipped; it's the same app, so its files and sign-ins stay.
+5. Open CyPort again: it plays (or, with the data left for later, asks for it – **Download from Steam, GOG or Epic…**).
+
+Steam always serves its newest Mac build; the shim knows **Steam 2.5.0** (see Requirements). A newer build may need a
+newer CyPort.
+
+### Download the game from Steam
+`tools/steam_download.sh` signs in to Steam and downloads **Cyberpunk 2077 for Mac (Apple Silicon / arm64)** from the account
+that owns it – the same Steam client as the in-app download (`shim/StoresCore.swift`), built as a small Mac command line tool.
+```bash
+STEAM_USER=<steam account> ./build.sh                          # download Cyberpunk2077.app, then build as usual
+tools/steam_download.sh --user <steam account> --out steam-game  # only download (prints the Cyberpunk2077.app path)
+tools/steam_download.sh --user <steam account> --all             # also the game data (~65 GB), to copy to the device yourself
+tools/steam_download.sh --sign-out                               # forget the saved sign-in
+```
+- **Sign-in:** password (asked for, or `STEAM_PASSWORD`), then Steam Guard: the email code, the Steam app code, or approve the
+  sign-in in the Steam app (`STEAM_GUARD_CODE` skips the question). The password is never stored; Steam's sign-in token is kept
+  in `~/.cyport/steam-credentials.json` (mode 0600), so later runs don't ask again.
+- **What it downloads:** the public branch of Steam's Mac depots (app 1091500). By default only `Cyberpunk2077.app` (what the
+  build needs); `--all` (or `STEAM_ALL=1` with `build.sh`) adds `archive`, `engine`, `r6`. Interrupted downloads resume.
+  Files are kept exactly as Steam ships them (the shim recognises the game program by its md5) and the tool checks that the
+  game program has arm64 code.
+- **Version:** Steam serves its current Mac build. CyPort's patches target GOG 2.3.1 and **Steam 2.5.0**; a newer Steam build
+  needs updated patches (`build.sh` says so: "not in kMSGames").
+- Options for `build.sh`: `STEAM_DIR` (download folder, default `./steam-game`), `STEAM_ALL=1`. `Build CyPort.command` also
+  takes a Steam account name instead of a dragged-in app. `CYPORT_VERBOSE=1` shows the store log.
 
 ### Free Apple ID (SideStore / LiveContainer)
 A free account can't turn on *Increased Memory Limit* by itself, and SideStore never adds it for free accounts.

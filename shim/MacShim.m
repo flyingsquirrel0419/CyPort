@@ -1001,7 +1001,7 @@ __attribute__((visibility("default"))) void NSRectFill(CGRect r) { (void)r; }
  * TVOut = NO in macshim.plist turns this off. */
 static UIWindow *g_tvWin; static UIView *g_tvPad;
 static CGFloat g_stickR = 60;                    /* on-screen stick radius (PadLayout: smaller on small screens) */
-static double g_stBottomGap = 4;                 /* the FPS overlay's distance from the bottom edge (above a home bar) */
+static double g_stTopGap = 4;                    /* the FPS overlay's distance from the top edge (below a notch / island) */
 /* Mirror: every frame the game presents is also copied (one GPU blit, same command queue, right after the game's
    command buffer) into a Metal layer on the phone, so the picture is on both screens. Touches map onto the picture. */
 static BOOL MSMirrorFit(UIView *v, CGRect *r) {
@@ -1104,7 +1104,7 @@ static void MSTVRoute(void) {                                     /* main thread
         MSLogf(@"screen: game picture %.0fx%.0f pt fitted to the phone's %.0fx%.0f pt at %.0f,%.0f (scale %.3f)", g_sw, g_sh,
                phone.bounds.size.width, phone.bounds.size.height, host.frame.origin.x, host.frame.origin.y, host.transform.a);
     }
-    g_stBottomGap = phone.safeAreaInsets.bottom > 0 ? 16 : 4;
+    g_stTopGap = phone.safeAreaInsets.top + 4;
     MSLogScreens(@"route");
 }
 static void MSTVObserve(void) {
@@ -1605,7 +1605,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
         NSFileManager *fm = NSFileManager.defaultManager;
         if ([fm fileExistsAtPath:[u.path stringByAppendingPathComponent:@"archive/pc"]] && ![fm fileExistsAtPath:[u.path stringByAppendingPathComponent:@"archive/Mac"]]) {
             MSLogf(@"setup: picked folder is a Windows copy (archive/pc, no archive/Mac) - not imported");
-            _status.text = @"That's the Windows version of the game. CyPort needs the Mac version's files, which come with your Steam or GOG purchase: tap \"Download from Steam, GOG or Epic…\", or copy the Mac version from a Mac.";
+            _status.text = @"That's the Windows version of the game. CyPort needs the Mac version's files, which come with your Steam or GOG purchase: tap \"Download from Steam, GOG or Epic…\".";
             [u stopAccessingSecurityScopedResource]; return;
         }
     }
@@ -4273,14 +4273,16 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     } else {
         if (CGSizeEqualToSize(S, _laidOut) && !force) return; _laidOut = S;
         UIEdgeInsets in = self.safeAreaInsets; CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
+        CGFloat B = T + MS_PAD_OVERLAY_H;
         pos = @{
             @"A": @[ @(R - 85), @(H - 40), @27 ],  @"B": @[ @(R - 35), @(H - 90), @27 ],  @"X": @[ @(R - 135), @(H - 90), @27 ], @"Y": @[ @(R - 85), @(H - 140), @27 ],
             @"RT": @[ @(R - 40), @(T + 40), @30 ], @"RB": @[ @(R - 115), @(T + 34), @24 ],
             @"LT": @[ @(L + 40), @(T + 40), @30 ], @"LB": @[ @(L + 115), @(T + 34), @24 ],
             @"L3": @[ @(L + 24), @(H - 24), @20 ], @"R3": @[ @(R - 170), @(H - 22), @20 ],
-            @"▲": @[ @(L + 190), @(T + 22), @16 ], @"▼": @[ @(L + 190), @(T + 86), @16 ], @"◀": @[ @(L + 158), @(T + 54), @16 ], @"▶": @[ @(L + 222), @(T + 54), @16 ],
-            @"⧉": @[ @(S.width / 2 - 55), @(T + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(T + 20), @17 ], @"🎮": @[ @(S.width / 2), @(T + 20), @17 ],
-            @"Esc": @[ @(S.width / 2 - 120), @(T + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(T + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(T + 20), @21 ],
+            /* B: the top band starts below the performance overlay (FPS pill, top centre) */
+            @"▲": @[ @(L + 190), @(B + 22), @16 ], @"▼": @[ @(L + 190), @(B + 86), @16 ], @"◀": @[ @(L + 158), @(B + 54), @16 ], @"▶": @[ @(L + 222), @(B + 54), @16 ],
+            @"⧉": @[ @(S.width / 2 - 55), @(B + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(B + 20), @17 ], @"🎮": @[ @(S.width / 2), @(B + 20), @17 ],
+            @"Esc": @[ @(S.width / 2 - 120), @(B + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(B + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(B + 20), @21 ],
         };
         _lHome = CGPointMake(L + 115, H - 105); _rHome = CGPointMake(-1000, -1000);   /* no fixed right stick: the right side is the camera */
         _faceC = CGPointMake(R - 85, H - 90); _faceGap = 50; _faceR = 27;               /* the A/B/X/Y diamond's centre (see pos) */
@@ -4288,7 +4290,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     }
     {   /* the layout editor's own buttons, then the player's saved layout for this screen size (✎ editor) */
         NSMutableDictionary *m = [pos mutableCopy]; CGFloat top = MAX(self.safeAreaInsets.top, 8);
-        m[@"✎"] = @[ @(S.width / 2), @(top + 58), @15 ];
+        m[@"✎"] = @[ @(S.width / 2), @(top + 58 + MS_PAD_OVERLAY_H), @15 ];
         NSArray *tools = @[ @"−", @"+", @"↺", @"✓" ];
         for (NSUInteger i = 0; i < tools.count; i++) m[tools[i]] = @[ @(S.width / 2 - 105 + 70 * (double)i), @(S.height / 2), @24 ];
         NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:[self msLayoutKey]];
@@ -5236,7 +5238,7 @@ static void MSStartReadProgress(void) {
                 CGFloat pw = ov == 2 ? 400 : 210;
                 [CATransaction begin]; [CATransaction setDisableActions:YES];
                 CGRect R = g_stRoot.bounds;
-                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 20 - g_stBottomGap, pw, 20); g_stBg.cornerRadius = 10;
+                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, g_stTopGap, pw, 20);       /* top centre (the keys there sit below it) */ g_stBg.cornerRadius = 10;
                 g_stBg.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45].CGColor;
                 g_stTitle.hidden = g_stLog.hidden = g_stTrack.hidden = YES;
                 g_stHead.frame = CGRectMake(10, 2, pw - 20, 16); g_stHead.alignmentMode = kCAAlignmentCenter; g_stHead.fontSize = 11; g_stHead.string = f;
@@ -5965,6 +5967,29 @@ __attribute__((constructor)) static void MSInstallURLSession(void) {
  * version the start screen's Update chose (CyPortGameVersion), else the newest. Then its game program is loaded and
  * its main() runs exactly as an executable's would. */
 extern char **environ;
+/* No game in the app (the IPA GitHub Actions builds, build.sh NO_GAME=1 - it has an empty Games/): the setup screen
+   signs in to Steam, gets the Mac game program and makes an IPA with it to install over this app
+   (shim/InstallerUI.swift + GameInstaller.swift). */
+@interface MSInstallerDelegate : UIResponder <UIApplicationDelegate> @property(nonatomic, strong) UIWindow *window; @end
+@implementation MSInstallerDelegate
+- (BOOL)msWaitForScene { return YES; }
+- (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)o {
+    if (!MSAppScene()) return YES;                    /* MSSceneDelegate calls this again once the scene is there */
+    self.window = [[UIWindow alloc] initWithWindowScene:MSAppScene()];
+    Class c = NSClassFromString(@"MSInstallerUI"); UIViewController *vc = nil;
+    if (c) vc = ((UIViewController *(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"make"));
+    if (!vc) {                                        /* a shim built without the Swift screens */
+        vc = [UIViewController new]; vc.view.backgroundColor = UIColor.blackColor;
+        UILabel *l = [UILabel new]; l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; l.textColor = UIColor.whiteColor;
+        l.text = @"This CyPort has no game program and its setup screen didn't load.\nInstall the CyPort IPA again.";
+        l.translatesAutoresizingMaskIntoConstraints = NO; [vc.view addSubview:l];
+        [NSLayoutConstraint activateConstraints:@[ [l.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor], [l.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor],
+                                                   [l.widthAnchor constraintLessThanOrEqualToAnchor:vc.view.widthAnchor constant:-48] ]];
+    }
+    self.window.rootViewController = vc; [self.window makeKeyAndVisible];
+    return YES;
+}
+@end
 __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
     NSString *games = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Games"];
     NSMutableArray<NSDictionary *> *vers = [NSMutableArray array];
@@ -5974,7 +5999,11 @@ __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
         if (pl && [NSFileManager.defaultManager fileExistsAtPath:[dir stringByAppendingPathComponent:@"CyberpunkGame.dylib"]])
             [vers addObject:@{ @"dir": dir, @"plist": pl }];
     }
-    if (!vers.count) { MSLogf(@"starter: no game versions in %@", games); abort(); }
+    if (!vers.count) {
+        MSLogf(@"starter: no game versions in %@ - showing the setup screen (get the game from Steam)", games);
+        @autoreleasepool { UIApplicationMain(argc, argv, nil, NSStringFromClass([MSInstallerDelegate class])); }
+        exit(0);
+    }
     [vers sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {      /* newest first */
         return [b[@"plist"][@"number"] compare:a[@"plist"][@"number"] ?: @0];
     }];
@@ -5993,7 +6022,12 @@ __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
     NSMutableArray *names = [NSMutableArray array]; for (NSDictionary *v in vers) [names addObject:v[@"plist"][@"version"] ?: @"?"];
     MSLogf(@"starter: game versions in this app: %@ - starting %@ (%@)", [names componentsJoinedByString:@", "], pick[@"plist"][@"version"], why);
     void *h = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
-    if (!h) { MSLogf(@"starter: could not load %@: %s", dylib, dlerror()); abort(); }
+    if (!h) {                 /* e.g. an app made on the phone without a valid signature: back to the setup screen, not a crash */
+        const char *e = dlerror(); MSLogf(@"starter: could not load %@: %s", dylib, e);
+        setenv("CYPORT_LOAD_ERROR", e ?: "unknown error", 1);
+        @autoreleasepool { UIApplicationMain(argc, argv, nil, NSStringFromClass([MSInstallerDelegate class])); }
+        exit(0);
+    }
     for (uint32_t k = 0; k < _dyld_image_count(); k++) {
         const char *n = _dyld_get_image_name(k);
         if (n && strstr(n, "/CyberpunkGame.dylib") && strstr(n, g_gameDir.lastPathComponent.UTF8String)) { g_gameHeader = _dyld_get_image_header(k); break; }

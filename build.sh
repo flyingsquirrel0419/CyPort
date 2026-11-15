@@ -7,13 +7,27 @@
 #                -> with SIGN_ID (+PROFILE) it signs here, entitlements generated from the profile; DEVICE=<udid> also installs.
 #                ENT=app/entitlements-memory.plist + ENT_FROM_PROFILE=0 to use a fixed entitlements file instead.
 #                Xcode on another disk: DEVELOPER_DIR=/Volumes/x/Xcode.app/Contents/Developer ./build.sh
+# No Mac game at all: NO_GAME=1 ./build.sh -> an app without the game (what GitHub Actions builds). On the phone it signs in
+#                to Steam, downloads + converts the game program itself and writes an IPA to install over it (see README).
+# No game on this Mac? Download it (arm64 Mac version) from the Steam account that owns it:
+#                STEAM_USER=<steam account> ./build.sh      (asks for the password + Steam Guard; tools/steam_download.sh)
+#                STEAM_DIR=/path (default ./steam-game)   STEAM_ALL=1 also downloads the game data (~65 GB)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Several game versions in ONE app: GAME_APPS="/path/2.31a/Cyberpunk2077.app|/path/2.5/Cyberpunk2077.app" - each goes into
 # Games/<version>/ and the app starts the one that fits the game data it finds (see MacShimMain in shim/MacShim.m).
 GAME_APPS="${GAME_APPS:-}"
 if [ -n "$GAME_APPS" ]; then IFS='|' read -ra GAME_LIST <<< "$GAME_APPS"; GAME_APP="${GAME_LIST[${#GAME_LIST[@]}-1]}"; fi
-GAME_APP="${GAME_APP:?set GAME_APP to the Cyberpunk2077.app folder (or GAME_APPS to several, separated by |)}"
+if [ -z "${GAME_APP:-}" ] && [ -n "${STEAM_USER:-}" ]; then
+  STEAM_DIR="${STEAM_DIR:-$HERE/steam-game}"
+  echo "==> 0/4 download Cyberpunk 2077 for Mac (arm64) from Steam ($STEAM_USER) into $STEAM_DIR"
+  STEAM_ARGS=(--user "$STEAM_USER" --out "$STEAM_DIR"); [ "${STEAM_ALL:-0}" = "1" ] && STEAM_ARGS+=(--all)
+  GAME_APP="$("$HERE/tools/steam_download.sh" "${STEAM_ARGS[@]}" | tail -n 1)"
+  [ -n "$GAME_APP" ] || { echo "Steam download failed"; exit 1; }
+fi
+NO_GAME="${NO_GAME:-0}"
+if [ "$NO_GAME" = "1" ]; then GAME_APP=""; GAME_APPS=""; REBUILD_SHIM=1
+else GAME_APP="${GAME_APP:?set GAME_APP to the Cyberpunk2077.app folder (or GAME_APPS to several, separated by |, or STEAM_USER to download it from Steam, or NO_GAME=1)}"; fi
 BUNDLE_ID="${BUNDLE_ID:-com.example.cyport}"
 ENT="${ENT:-$HERE/app/entitlements-basic.plist}"
 # Output (override with OUT=/some/folder)
@@ -22,7 +36,9 @@ mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 1; }
 APP="$OUT/Payload/Cyberpunk2077.app"
 SDK_CACHE="${SDK_CACHE:-$OUT/.ios-sdk}"
 echo "==> output folder: $OUT"
-[ -f "$GAME_APP/Contents/MacOS/Cyberpunk2077" ] || { echo "not found: $GAME_APP/Contents/MacOS/Cyberpunk2077"; exit 1; }
+if [ "$NO_GAME" != "1" ]; then
+  [ -f "$GAME_APP/Contents/MacOS/Cyberpunk2077" ] || { echo "not found: $GAME_APP/Contents/MacOS/Cyberpunk2077"; exit 1; }
+fi
 rm -rf "$OUT/Payload" "$OUT"/*.ipa; mkdir -p "$APP/Frameworks"   # only our own outputs are cleared
 
 if [ "${REBUILD_SHIM:-0}" = "1" ] || [ ! -f "$HERE/prebuilt/libMacShim.dylib" ]; then
@@ -56,13 +72,17 @@ SWIFT_OBJ=""; SWIFT_LD=""
 if command -v swiftc >/dev/null 2>&1 || xcrun -f swiftc >/dev/null 2>&1; then
   SWIFTC="$(xcrun -f swiftc 2>/dev/null || command -v swiftc)"; TC="$(dirname "$(dirname "$SWIFTC")")"
   "$SWIFTC" -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -emit-object -module-name MacShimUI \
-    -wmo "$HERE/shim/Launcher.swift" "$HERE/shim/StoresCore.swift" "$HERE/shim/StoresUI.swift" "$HERE/shim/GameCloud.swift" -o "$APP/Frameworks/Launcher.o" && SWIFT_OBJ="$APP/Frameworks/Launcher.o" \
-    && SWIFT_LD="-L$SDK/usr/lib/swift -L$TC/lib/swift/iphoneos -Xlinker -rpath -Xlinker /usr/lib/swift"
+    -wmo "$HERE/shim/Launcher.swift" "$HERE/shim/StoresCore.swift" "$HERE/shim/StoresUI.swift" "$HERE/shim/GameCloud.swift" \
+    "$HERE/shim/MachORetarget.swift" "$HERE/shim/GameInstaller.swift" "$HERE/shim/InstallerUI.swift" "$HERE/shim/CyStyle.swift" "$HERE/shim/DownloadPiP.swift" "$HERE/shim/MachOSign.swift" -o "$APP/Frameworks/Launcher.o" \
+    || { echo "error: the SwiftUI screens (shim/*.swift) didn't compile - see above" >&2; exit 1; }
+  SWIFT_OBJ="$APP/Frameworks/Launcher.o"
+  SWIFT_LD="-L$SDK/usr/lib/swift -L$TC/lib/swift/iphoneos -Xlinker -rpath -Xlinker /usr/lib/swift"
 fi
 clang $LDFLAG -target arm64-apple-ios16.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2 $SWIFT_LD \
   -install_name @rpath/libMacShim.dylib -compatibility_version 9999.0.0 -current_version 9999.0.0 \
   -framework Foundation -framework UIKit -framework GameController -framework QuartzCore \
-  -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit -lz \
+  -framework Security -framework CoreGraphics -framework CoreFoundation -framework Metal -framework UniformTypeIdentifiers -framework WebKit \
+  -framework AVFoundation -framework AVKit -framework CoreMedia -framework CoreVideo -lz \
   -Wl,-reexport_framework,Foundation -Wl,-reexport_framework,CoreGraphics -Wl,-reexport_framework,Security -Wl,-reexport_framework,Metal \
   "$HERE/shim/MacShim.m" "$HERE/shim/MacShimC.c" "$HERE/shim/PadLayout.c" "$HERE/shim/StoreCodecs.c" "$HERE/shim/third_party/lzma/LzmaDec.c" $SWIFT_OBJ \
   -o "$APP/Frameworks/libMacShim.dylib"
@@ -92,9 +112,11 @@ if ! grep -q MSSceneDelegate "$APP/Frameworks/libMacShim.dylib"; then
   OLD_SHIM=1; SDK_VER="18.0"; SDK_NAME=""; SDK_BUILD=""
   echo "    this MacShim predates scene support: stamping iOS SDK 18.0 (REBUILD_SHIM=1 for an iPhone Duo's real screen sizes)"
 fi
-if [ -n "$GAME_APPS" ]; then
+if [ -n "$GAME_APPS" ] || [ "$NO_GAME" = "1" ]; then
 echo "==> 2/4 game versions -> Games/<version>/ (one app, the starter picks the version that fits the game data)"
-for ga in "${GAME_LIST[@]}"; do
+mkdir -p "$APP/Games"                    # NO_GAME: empty - the app gets its game on the phone (shim/GameInstaller.swift)
+[ "$NO_GAME" = "1" ] && GAME_LIST=() && echo "    no game (NO_GAME=1): the app sets itself up from Steam on the phone"
+for ga in ${GAME_LIST[@]+"${GAME_LIST[@]}"}; do
   [ -f "$ga/Contents/MacOS/Cyberpunk2077" ] || { echo "not found: $ga/Contents/MacOS/Cyberpunk2077"; exit 1; }
   python3 "$HERE/tools/data_manifest.py" "$ga" "$OUT/.data.json" || { echo "every game version needs its data list (GOG build info)"; exit 1; }
   v="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"].split("_")[0])' "$OUT/.data.json")"
@@ -139,19 +161,20 @@ plutil -replace DTSDKName -string "${SDK_NAME:-iphoneos$SDK_VER}" "$APP/Info.pli
 [ -n "$SDK_BUILD" ] && { plutil -replace DTSDKBuild -string "$SDK_BUILD" "$APP/Info.plist"; plutil -replace DTPlatformBuild -string "$SDK_BUILD" "$APP/Info.plist"; }
 # the game's own version (the start screen and the store downloads match the game data to it)
 for k in CFBundleShortVersionString CFBundleVersion; do
+  [ -n "$GAME_APP" ] || continue
   v="$(/usr/libexec/PlistBuddy -c "Print :$k" "$GAME_APP/Contents/Info.plist" 2>/dev/null || true)"
   [ -n "$v" ] && /usr/libexec/PlistBuddy -c "Set :$k $v" "$APP/Info.plist"
 done
 # which game program this is: the shim picks its addresses inside the game by it (kMSGames in shim/MacShim.m)
 # (several versions: each Games/<version>/game.plist has its own)
-if [ -z "$GAME_APPS" ]; then
+if [ -z "$GAME_APPS" ] && [ "$NO_GAME" != "1" ]; then
 EXE_MD5="$(md5 -q "$GAME_APP/Contents/MacOS/Cyberpunk2077" 2>/dev/null || md5sum "$GAME_APP/Contents/MacOS/Cyberpunk2077" | cut -d' ' -f1)"
 /usr/libexec/PlistBuddy -c "Add :CyPortGameExe string $EXE_MD5" "$APP/Info.plist"
 grep -q "$EXE_MD5" "$HERE/shim/MacShim.m" || echo "    NOTE: game program $EXE_MD5 is not in kMSGames (shim/MacShim.m): mouse gate / controller-ready check / free hook stay off"
 fi
 # which game data this game program needs (sizes + checksums from GOG's public build info): the start screen checks
 # the data against it, and "Update Cyberpunk" downloads only the files that differ. Skipped (with a note) when offline.
-if [ "${NO_DATA_MANIFEST:-0}" != "1" ] && [ -z "$GAME_APPS" ]; then
+if [ "${NO_DATA_MANIFEST:-0}" != "1" ] && [ -z "$GAME_APPS" ] && [ "$NO_GAME" != "1" ]; then
   python3 "$HERE/tools/data_manifest.py" "$GAME_APP" "$APP/CyPortData.json" \
     || { rm -f "$APP/CyPortData.json"; echo "    (no CyPortData.json: the app won't check or update the game data)"; }
 fi

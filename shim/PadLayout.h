@@ -22,6 +22,7 @@ typedef struct {
 typedef struct { const char *name; double x0, y0, x1, y1; } MSPadZone;
 extern const MSPadZone MSPadHUD[]; extern const int MSPadHUDCount;
 #define MS_PAD_HUD_SLACK 4                    /* a control may reach this far (points) into a HUD zone */
+#define MS_PAD_OVERLAY_H 26                   /* the performance overlay (FPS pill) at the top centre: the top band starts below it */
 
 MSRect MSPadPicture(MSPadScreen s);           /* where the game's picture goes (scaled to fit) */
 void MSPadLayout(MSPadScreen s, MSPadPos *p); /* p: MS_PAD_COUNT entries */

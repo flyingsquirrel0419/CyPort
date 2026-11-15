@@ -175,9 +175,9 @@ void MSPadLayout(MSPadScreen s, MSPadPos *p) {
     /* top band: right of the health bar / call portrait (left 30% of the picture), left of the minimap (right 16%) */
     double bandL = maxd(L, pic.x + 0.30 * pic.w), bandR = mind(R, pic.x + 0.84 * pic.w) - 12 * k;
     if (s.duoInner) bandR = mind(bandR, s.w - 95 - 12);
-    double dxc = bandL + 48 * k;
-    dpad(&c, dxc, T + 54 * k, k, 1, 0);
+    double dxc = bandL + 48 * k, bandT = T + MS_PAD_OVERLAY_H;      /* below the performance overlay (top centre) */
+    dpad(&c, dxc, bandT + 54 * k, k, 1, 0);
     dxc = p[MS_PAD_UP].x;
-    double ky = T + rk(21, k) + 1;
+    double ky = bandT + rk(21, k) + 1;
     if (!keys(&c, dxc + 48 * k + 14 * k, bandR, ky, k, 1, 1)) keys(&c, dxc + 48 * k + 14 * k, R, ky, k, 1, 1);
 }
