@@ -575,12 +575,13 @@ enum SteamCloud {
         var remoteByRel: [String: String] = [:]
         for c in cloud { if let r = c.remote { remoteByRel[c.rel] = r } }
         // a new file goes where the existing saves are (same path prefix, e.g. "%WinSavedGames%CD Projekt Red/Cyberpunk 2077/")
-        let prefix = cloud.lazy.compactMap { c in c.remote.flatMap { $0.hasSuffix(c.rel) ? String($0.dropLast(c.rel.count)) : nil } }.first
-        let named: [(GameCloud.LocalFile, String)] = try files.map { f in
-            if let r = remoteByRel[f.rel] { return (f, r) }
-            guard let p = prefix else { throw StoreError("Steam Cloud has no Cyberpunk saves yet - play once on a computer with Steam first.") }
-            return (f, p + f.rel)
+        // (no saves there yet: the place Steam's app info names for them - the first save made here starts Steam Cloud)
+        var prefix = cloud.lazy.compactMap { c in c.remote.flatMap { $0.hasSuffix(c.rel) ? String($0.dropLast(c.rel.count)) : nil } }.first
+        if prefix == nil {
+            prefix = await SteamStore.shared.cloudSavePrefix()
+            GameCloud.log("Steam: no saves in Steam Cloud yet - the first ones go to \(prefix!)")
         }
+        let named: [(GameCloud.LocalFile, String)] = files.map { f in (f, remoteByRel[f.rel] ?? prefix! + f.rel) }
         let cm = SteamStore.shared.cm, app = UInt64(Game.steamApp)
         var b = PBWriter(); b.u(1, app); b.s(2, "CyPort (iPhone)")
         for (_, n) in named { b.s(3, n) }

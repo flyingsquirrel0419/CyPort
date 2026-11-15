@@ -953,6 +953,28 @@ final class SteamStore: @unchecked Sendable {
 
     /// the app's Mac depots (base game, owned DLC, English) from Steam's app info
     func macDepots(app: UInt32 = Game.steamApp) async throws -> (depots: [Depot], buildID: String) {
+        let info = try await appInfo(app)
+        guard let depots = info["depots"] else { throw StoreError("Steam app info has no depots") }
+        return try macDepots(depots)
+    }
+
+    /// where Steam Cloud keeps Cyberpunk's saves, from the app info (ufs > savefiles: root + path), e.g.
+    /// "%WinSavedGames%CD Projekt Red/Cyberpunk 2077/" - for a first upload when Steam Cloud has no saves to copy it from
+    func cloudSavePrefix(app: UInt32 = Game.steamApp) async -> String {
+        let fallback = "%WinSavedGames%CD Projekt Red/Cyberpunk 2077/"
+        guard let info = try? await appInfo(app), let sf = info["ufs"]?["savefiles"] else { return fallback }
+        for (_, e) in sf.children {
+            guard let root = e["root"]?.string, var path = e["path"]?.string, path.contains("Cyberpunk") else { continue }
+            if root.lowercased().hasPrefix("mac") || root.lowercased().hasPrefix("linux") { continue }   // the Windows (canonical) entry
+            path = path.replacingOccurrences(of: "\\", with: "/")
+            if !path.hasSuffix("/") { path += "/" }
+            return "%\(root)%\(path)"
+        }
+        return fallback
+    }
+
+    /// the app's info (KeyValues) from Steam (PICS)
+    func appInfo(_ app: UInt32) async throws -> KV {
         if !loggedOn { try await logOn() }
         var tq = PBWriter(); tq.u(2, UInt64(app))
         let tr = try PBMessage(try await cm.call(.picsAccessTokenRequest, tq).body)
@@ -969,8 +991,10 @@ final class SteamStore: @unchecked Sendable {
         }
         guard let buf = buffer else { throw StoreError("Steam sent no app info for Cyberpunk 2077") }
         let root = KV.parse(String(decoding: buf, as: UTF8.self))
-        let info = root["appinfo"] ?? root.children.first?.1 ?? root
-        guard let depots = info["depots"] else { throw StoreError("Steam app info has no depots") }
+        return root["appinfo"] ?? root.children.first?.1 ?? root
+    }
+
+    private func macDepots(_ depots: KV) throws -> (depots: [Depot], buildID: String) {
         let build = depots["branches"]?["public"]?["buildid"]?.string ?? "?"
         var out: [Depot] = []
         for (k, d) in depots.children {
