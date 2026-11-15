@@ -19,6 +19,11 @@ final class DownloadPiP: NSObject, ObservableObject {
     private var title = "", fraction = 0.0, line1 = "Starting…", line2 = ""
     private var lastDone: Int64 = 0, beatDone: Int64 = -1, beatAt = 0.0          // the 20 s heartbeat in macshim.log
     private static let size = CGSize(width: 640, height: 360)
+    /// silence played while downloading: PiP alone didn't stop iOS from suspending the app for minutes at a time
+    /// (macshim.log 2026-11-15: no heartbeat for 513 s, then every request timed out - likely the screen locked);
+    /// an app playing audio keeps running (LiveContainer and app/Info.plist have the audio background mode)
+    /// (AVAudioPlayer, not AVAudioEngine: MacShim pauses every AVAudioEngine when the app goes to the background)
+    private var silence: AVAudioPlayer?
 
     var supported: Bool { AVPictureInPictureController.isPictureInPictureSupported() }
 
@@ -40,6 +45,7 @@ final class DownloadPiP: NSObject, ObservableObject {
             c.delegate = self
             controller = c
         }
+        startSilence()
         running = true
         render()
         timer?.invalidate()
@@ -61,7 +67,25 @@ final class DownloadPiP: NSObject, ObservableObject {
         timer?.invalidate(); timer = nil
         controller?.stopPictureInPicture()
         layer.flush()
+        silence?.stop(); silence = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func startSilence() {
+        guard silence == nil else { return }
+        // one second of 16-bit mono 8 kHz zeros as a WAV file, played on a loop
+        let rate = 8000, n = rate * 2
+        func le(_ v: Int, _ k: Int) -> [UInt8] { (0..<k).map { UInt8(truncatingIfNeeded: v >> (8 * $0)) } }
+        var w = Array("RIFF".utf8) + le(36 + n, 4) + Array("WAVEfmt ".utf8) + le(16, 4) + le(1, 2) + le(1, 2)
+        w += le(rate, 4) + le(rate * 2, 4) + le(2, 2) + le(16, 2) + Array("data".utf8) + le(n, 4)
+        w += [UInt8](repeating: 0, count: n)
+        do {
+            let p = try AVAudioPlayer(data: Data(w))
+            p.numberOfLoops = -1
+            guard p.play() else { storeLog("pip: silent audio didn't start"); return }
+            silence = p
+            storeLog("pip: silent audio on (keeps the download going with the screen locked)")
+        } catch { storeLog("pip: silent audio: \(error.localizedDescription)") }
     }
 
     func toggle() {
@@ -80,7 +104,7 @@ final class DownloadPiP: NSObject, ObservableObject {
     /// every 20 s while downloading: is the app still running in the background (PiP), how fast is it going
     private func heartbeat() {
         let now = CFAbsoluteTimeGetCurrent()
-        if beatDone < 0 { beatDone = lastDone; beatAt = now; return }
+        if beatDone < 0 { if lastDone > 0 { beatDone = lastDone; beatAt = now }; return }    // after the first progress
         guard now - beatAt >= 20 else { return }
         let app = UIApplication.shared
         let state = app.applicationState == .active ? "foreground" : app.applicationState == .background ? "background" : "inactive"

@@ -167,7 +167,7 @@ final class NetMeter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 enum Net {
     static let session: URLSession = {
         let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 16; c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.timeoutIntervalForRequest = 20; c.httpMaximumConnectionsPerHost = 16; c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
         return URLSession(configuration: c, delegate: NetMeter.shared, delegateQueue: nil)
     }()
@@ -337,9 +337,15 @@ final class Downloader: @unchecked Sendable {
     /// requests at once: tuned while it runs (see `tune`). Steam's caches took 3-20 s per 1 MB chunk of the Mac game
     /// data; 47 at once gave 1.5-2.7 MB/s, 128 at once less (timeouts, lost connections - a home router or the line
     /// doesn't like that many), the game program 10 MB/s with the same settings (macshim.log, 2026-11-15)
+    /// Until v1.4-steam.11 "requests at once" also counted chunks that had arrived and were only waiting for their turn
+    /// to be written, so one slow chunk (Fastly: 6-17 s) stopped new requests and only ~6 were really on the network.
+    /// Now it counts requests on the network only, and a chunk the writer waits on too long is asked for again from
+    /// another server (whichever answers first wins).
     var parallel = 24
-    let minParallel = 8, maxParallel = 96
-    var aheadLimit = 320 << 20
+    let minParallel = 8, maxParallel = 64
+    var aheadLimit = 256 << 20
+    /// the writer waits on a chunk this long (from when it was requested) before asking another server for it too
+    let hedgeAfter = 4.0
     private let journalURL: URL
     private var journal: [String: Int64] = [:]           // path -> bytes known good (complete files: their size)
     private let lock = NSLock()
@@ -388,14 +394,21 @@ final class Downloader: @unchecked Sendable {
         for s in starts { for p in s.part..<plan.files[s.file].parts.count { queue.append((s.file, p)) } }
         var ahead = 0                                       // next queue index to start fetching
         var aheadBytes = 0                                  // bytes of the parts in queue[qi..<ahead]
+        let onNet = Gauge()                                 // requests on the network now (not ones that arrived)
+        var started: [Int: Double] = [:]
+        func start(_ c: Int) -> Task<Data, Error> {
+            onNet.add(1); started[c] = CFAbsoluteTimeGetCurrent()
+            return Task { defer { onNet.add(-1) }; return try await fetch(c) }
+        }
         func pump() {
-            while ahead < queue.count && inflight.count < parallel && aheadBytes < aheadLimit {
+            while ahead < queue.count && onNet.value < parallel && aheadBytes < aheadLimit {
                 let pa = plan.files[queue[ahead].file].parts[queue[ahead].part], c = pa.chunk
                 ahead += 1; aheadBytes += pa.length
                 if cache[c] != nil || inflight[c] != nil { continue }
-                inflight[c] = Task { try await fetch(c) }
+                inflight[c] = start(c)
             }
         }
+        var hedged = 0, hedgeWon = 0
         var lastSave = Date()
         setLive(done, nil)
         // the screen: 4 updates a second; speed = network bytes over the last 3 s, time left from that speed
@@ -428,7 +441,8 @@ final class Downloader: @unchecked Sendable {
             if lastRate > 0 && rate < lastRate * 1.05 { dir = -dir }
             let was = parallel
             parallel = min(maxParallel, max(minParallel, parallel + dir * 8))
-            storeLog(String(format: "download: %.2f MB/s from the network with %d requests at once -> %d", rate / 1e6, was, parallel))
+            storeLog(String(format: "download: %.2f MB/s from the network with %d requests at once -> %d (%d slow chunks asked again, %d of them came first)",
+                            rate / 1e6, was, parallel, hedged, hedgeWon))
             lastRate = rate; tuneAt = now; tuneNet = net
         }
         // files that already finished (or are empty) still need to exist
@@ -455,10 +469,22 @@ final class Downloader: @unchecked Sendable {
             let data: Data
             if let d = cache[part.chunk] { data = d }
             else {
-                let t = inflight[part.chunk] ?? Task { try await fetch(part.chunk) }
-                inflight[part.chunk] = nil
+                let c = part.chunk
+                let t = inflight[c] ?? start(c)
+                inflight[c] = nil
                 let w0 = CFAbsoluteTimeGetCurrent()
-                data = try await t.value
+                let wait = max(0.05, hedgeAfter - (w0 - (started[c] ?? w0)))
+                switch await Self.first(t, within: wait) {
+                case .some(.success(let d)): data = d
+                case .some(.failure(let e)): throw e
+                case .none:                                 // still not here: another server too, the first answer wins
+                    hedged += 1
+                    let t2 = start(c)
+                    let (d, second) = try await Self.race(t, t2)
+                    if second { hedgeWon += 1 }
+                    data = d
+                }
+                started[c] = nil
                 waited += CFAbsoluteTimeGetCurrent() - w0
             }
             uses[part.chunk] -= 1
@@ -477,18 +503,49 @@ final class Downloader: @unchecked Sendable {
             if now.timeIntervalSince(lastSave) > 5 { try current?.synchronize(); saveJournal(); lastSave = now }
             let tn = CFAbsoluteTimeGetCurrent()
             if tn - statFrom > 20 {
-                storeLog(String(format: "download: %.2f MB/s written, %.0f%% of the time waiting for the network, %d requests running, %.0f MB ahead",
-                                Double(done - statDone) / (tn - statFrom) / 1e6, waited / (tn - statFrom) * 100, inflight.count, Double(aheadBytes) / 1e6))
+                storeLog(String(format: "download: %.2f MB/s written, %.0f%% of the time waiting for the network, %d requests on the network, %d chunks arrived early, %.0f MB ahead",
+                                Double(done - statDone) / (tn - statFrom) / 1e6, waited / (tn - statFrom) * 100, onNet.value, inflight.count, Double(aheadBytes) / 1e6))
                 statFrom = tn; statDone = done; waited = 0
             }
             // keep the decoded-chunk cache bounded (Epic chunks can be shared between far-apart files)
             if cache.count > 256 { for k in cache.keys.prefix(cache.count - 192) { cache[k] = nil } }
         }
         try? fm.removeItem(at: journalURL)
+        for t in inflight.values { t.cancel() }
         ticker.cancel()
         progress(Progress(done: total, total: total, bytesPerSecond: 0, secondsLeft: 0, file: ""))
         storeLog("download complete")
     }
+}
+
+extension Downloader {
+    /// the task's result if it finishes within `seconds`, nil if not (the task keeps going)
+    static func first(_ t: Task<Data, Error>, within seconds: Double) async -> Result<Data, Error>? {
+        await withTaskGroup(of: Result<Data, Error>?.self) { g in
+            g.addTask { do { return .success(try await t.value) } catch { return .failure(error) } }
+            g.addTask { try? await Task.sleep(nanoseconds: UInt64(seconds * 1e9)); return nil }
+            let r = await g.next()!
+            g.cancelAll()
+            return r
+        }
+    }
+    /// the first of two requests for the same chunk to succeed (the other is cancelled); fails only if both fail.
+    /// `second`: the later request won
+    static func race(_ a: Task<Data, Error>, _ b: Task<Data, Error>) async throws -> (Data, second: Bool) {
+        try await withThrowingTaskGroup(of: (Data, Bool)?.self) { g in
+            g.addTask { (try? await a.value).map { ($0, false) } }
+            g.addTask { (try? await b.value).map { ($0, true) } }
+            for try await r in g { if let r { g.cancelAll(); (r.1 ? a : b).cancel(); return r } }
+            _ = try await a.value                       // both failed: throw the first one's error
+            throw StoreError("chunk failed")
+        }
+    }
+}
+
+final class Gauge: @unchecked Sendable {
+    private var n = 0; private let l = NSLock()
+    func add(_ d: Int) { l.lock(); n += d; l.unlock() }
+    var value: Int { l.lock(); defer { l.unlock() }; return n }
 }
 
 // MARK: - minimal protobuf (Steam)
@@ -1004,14 +1061,21 @@ final class SteamStore: @unchecked Sendable {
             for attempt in 0..<6 {
                 let host = pool.take()
                 let t0 = CFAbsoluteTimeGetCurrent()
+                var answered = false                                       // the server's part is over (done() was called)
                 do {
                     let enc = try await Net.request(URL(string: "https://\(host)/depot/\(c.depot)/chunk/\(c.sha.hex)")!, tries: 1)
-                    pool.done(host, bytes: enc.count, seconds: CFAbsoluteTimeGetCurrent() - t0)
+                    pool.done(host, bytes: enc.count, seconds: CFAbsoluteTimeGetCurrent() - t0); answered = true
                     let plain = try Self.decodeChunk(enc, key: ks[c.depot]!, size: c.size)
                     guard Hash.steamAdler(plain) == c.crc else { throw StoreError("chunk checksum mismatch") }
                     return plain
-                } catch is CancellationError { pool.release(host); throw CancellationError() }
-                catch { pool.failed(host, error); last = error }
+                } catch {
+                    // cancelled: another server answered first for this chunk (not this server's fault)
+                    if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                        if !answered { pool.release(host) }
+                        throw CancellationError()
+                    }
+                    if answered { last = error } else { pool.failed(host, error); last = error }
+                }
                 if attempt > 0 { try await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000) }
             }
             throw last
@@ -1089,7 +1153,12 @@ final class SteamStore: @unchecked Sendable {
 /// server keeps its requests longer, so it gets fewer new ones - the fast ones end up doing most of the work).
 /// A server that fails twice in a row sits out 30 s. Logs what each server did every 20 s (macshim.log).
 final class HostPool: @unchecked Sendable {
-    private struct H { let name: String; var running = 0, fails = 0, ok = 0, bytes = 0, seconds = 0.0, errors = 0; var outUntil = 0.0; var lastError = "" }
+    private struct H { let name: String; var running = 0, fails = 0, ok = 0, bytes = 0, seconds = 0.0, errors = 0; var outUntil = 0.0; var lastError = ""
+        var recent = 0.0                                                   // seconds per chunk lately (0: not known yet)
+        /// when a new request here would be expected to finish: slow servers (Fastly took 6-17 s a chunk when the
+        /// others took 1-4 s) get fewer requests, not the same number
+        var cost: Double { Double(running + 1) * (recent > 0 ? recent : 1.5) }
+    }
     private var hs: [H]
     private let l = NSLock()
     private var lastLog = CFAbsoluteTimeGetCurrent()
@@ -1099,8 +1168,8 @@ final class HostPool: @unchecked Sendable {
         let now = CFAbsoluteTimeGetCurrent()
         var best = -1
         for i in hs.indices where hs[i].outUntil <= now {
-            // fewer running wins; on a tie the server Steam ranked higher (earlier) wins
-            if best < 0 || hs[i].running < hs[best].running { best = i }
+            // soonest expected answer wins; on a tie the server Steam ranked higher (earlier) wins
+            if best < 0 || hs[i].cost < hs[best].cost { best = i }
         }
         if best < 0 { best = hs.indices.min { hs[$0].outUntil < hs[$1].outUntil }! }
         hs[best].running += 1
@@ -1110,12 +1179,13 @@ final class HostPool: @unchecked Sendable {
     func release(_ h: String) { l.lock(); if let i = index(h) { hs[i].running -= 1 }; l.unlock() }
     func done(_ h: String, bytes: Int, seconds: Double) {
         l.lock()
-        if let i = index(h) { hs[i].running -= 1; hs[i].fails = 0; hs[i].ok += 1; hs[i].bytes += bytes; hs[i].seconds += seconds }
+        if let i = index(h) { hs[i].running -= 1; hs[i].fails = 0; hs[i].ok += 1; hs[i].bytes += bytes; hs[i].seconds += seconds
+            hs[i].recent = hs[i].recent > 0 ? hs[i].recent * 0.8 + seconds * 0.2 : seconds }
         let now = CFAbsoluteTimeGetCurrent(), report = now - lastLog > 20
         if report { lastLog = now }
         let lines = report ? hs.filter { $0.ok + $0.errors > 0 }.map {
-            String(format: "%@ %d ok %.0f MB, %.0f ms/chunk, %.2f MB/s per request, %d errors%@", $0.name, $0.ok, Double($0.bytes) / 1e6,
-                   $0.ok > 0 ? $0.seconds / Double($0.ok) * 1000 : 0, $0.seconds > 0 ? Double($0.bytes) / $0.seconds / 1e6 : 0,
+            String(format: "%@ %d ok %.0f MB, %.0f ms/chunk (lately %.0f), %.2f MB/s per request, %d errors%@", $0.name, $0.ok, Double($0.bytes) / 1e6,
+                   $0.ok > 0 ? $0.seconds / Double($0.ok) * 1000 : 0, $0.recent * 1000, $0.seconds > 0 ? Double($0.bytes) / $0.seconds / 1e6 : 0,
                    $0.errors, $0.lastError.isEmpty ? "" : " (last: \($0.lastError))")
         } : []
         l.unlock()
@@ -1126,6 +1196,7 @@ final class HostPool: @unchecked Sendable {
         var first = false
         if let i = index(h) {
             hs[i].running -= 1; hs[i].fails += 1; hs[i].errors += 1; first = hs[i].errors <= 3
+            hs[i].recent = max(hs[i].recent, 1.5) * 1.5
             hs[i].lastError = e.localizedDescription
             if hs[i].fails >= 2 { hs[i].outUntil = CFAbsoluteTimeGetCurrent() + 30; hs[i].fails = 0 }
         }
