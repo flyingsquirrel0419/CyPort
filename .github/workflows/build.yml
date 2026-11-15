@@ -51,7 +51,7 @@ jobs:
           T="$RUNNER_TEMP/ipa"; rm -rf "$T"; mkdir -p "$T"; unzip -q build/CyPort-unsigned.ipa -d "$T"
           L="$(find "$T" -name libMacShim.dylib | head -n 1)"
           for c in MSInstallerUI MSSwiftLauncher MSStoreUI; do
-            strings -a "$L" | grep -qx "$c" || { echo "missing class $c in libMacShim.dylib"; exit 1; }
+            strings -a "$L" 2>/dev/null | grep -qx "$c" || { echo "missing class $c in libMacShim.dylib"; exit 1; }
           done
           echo "all screens are in the app"
 
