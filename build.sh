@@ -73,7 +73,7 @@ if command -v swiftc >/dev/null 2>&1 || xcrun -f swiftc >/dev/null 2>&1; then
   SWIFTC="$(xcrun -f swiftc 2>/dev/null || command -v swiftc)"; TC="$(dirname "$(dirname "$SWIFTC")")"
   "$SWIFTC" -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -emit-object -module-name MacShimUI \
     -wmo "$HERE/shim/Launcher.swift" "$HERE/shim/StoresCore.swift" "$HERE/shim/StoresUI.swift" "$HERE/shim/GameCloud.swift" \
-    "$HERE/shim/MachORetarget.swift" "$HERE/shim/GameInstaller.swift" "$HERE/shim/InstallerUI.swift" "$HERE/shim/CyStyle.swift" "$HERE/shim/DownloadPiP.swift" -o "$APP/Frameworks/Launcher.o" \
+    "$HERE/shim/MachORetarget.swift" "$HERE/shim/GameInstaller.swift" "$HERE/shim/InstallerUI.swift" "$HERE/shim/CyStyle.swift" "$HERE/shim/DownloadPiP.swift" "$HERE/shim/MachOSign.swift" -o "$APP/Frameworks/Launcher.o" \
     || { echo "error: the SwiftUI screens (shim/*.swift) didn't compile - see above" >&2; exit 1; }
   SWIFT_OBJ="$APP/Frameworks/Launcher.o"
   SWIFT_LD="-L$SDK/usr/lib/swift -L$TC/lib/swift/iphoneos -Xlinker -rpath -Xlinker /usr/lib/swift"

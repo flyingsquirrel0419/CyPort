@@ -39,6 +39,10 @@ jobs:
           python3 -I tools/retarget_test/make_fixture.py "$RG" "$T/rg-fixture"
           tools/test_retarget.sh "$T/rg-fixture" "$RG"
 
+      - name: Test on-device signing against codesign
+        # MachOSign.swift must write a signature the Mac's own codesign accepts (dyld refused the Mac one left in the file)
+        run: tools/test_sign.sh "$RUNNER_TEMP/retarget/rg-fixture"
+
       - name: Build the Mac Steam downloader (compile check)
         run: tools/steam_download.sh --help
 

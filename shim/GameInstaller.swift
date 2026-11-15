@@ -111,10 +111,14 @@ final class GameInstaller: @unchecked Sendable {
         var log: [String] = []
         progress("Converting the game program for iOS…")
         log += try MachORetarget.retarget(src: exe, dst: g.appendingPathComponent("CyberpunkGame.dylib"))
+        // like build.sh's `codesign -f -s -`: the Mac signature left in the file no longer matches (dyld refuses it)
+        progress("Signing the game program…")
+        try MachOSign.sign(file: g.appendingPathComponent("CyberpunkGame.dylib"), identifier: "CyberpunkGame")
         let libs = (try? fm.contentsOfDirectory(at: app.appendingPathComponent("Contents/Frameworks"), includingPropertiesForKeys: nil)) ?? []
         for l in libs where l.pathExtension == "dylib" {
             progress("Converting \(l.lastPathComponent)…")
             log += try MachORetarget.retarget(src: l, dst: g.appendingPathComponent("Frameworks/\(l.lastPathComponent)")).map { "\(l.lastPathComponent): \($0)" }
+            try MachOSign.sign(file: g.appendingPathComponent("Frameworks/\(l.lastPathComponent)"), identifier: l.deletingPathExtension().lastPathComponent)
         }
         for l in log { storeLog("retarget: \(l)") }
         let plist: [String: Any] = ["version": version, "number": number, "CyPortGameExe": md5, "shortVersion": short, "bundleVersion": bundleVersion,
