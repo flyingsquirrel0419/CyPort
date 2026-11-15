@@ -64,8 +64,8 @@ extension View {
 /// yellow, black heavy upper-case text (PLAY, UPDATE CYBERPUNK)
 struct CyPrimaryButtonStyle: ButtonStyle {
     var fill = false
-    func makeBody(configuration: Configuration) -> some View { Body(configuration: configuration, fill: fill) }
-    private struct Body: View {
+    func makeBody(configuration: Configuration) -> some View { StyleBody(configuration: configuration, fill: fill) }
+    private struct StyleBody: View {
         let configuration: Configuration
         let fill: Bool
         @Environment(\.isEnabled) private var enabled
@@ -85,8 +85,8 @@ struct CyPrimaryButtonStyle: ButtonStyle {
 /// outlined yellow (Sign in, Back)
 struct CySecondaryButtonStyle: ButtonStyle {
     var fill = false
-    func makeBody(configuration: Configuration) -> some View { Body(configuration: configuration, fill: fill) }
-    private struct Body: View {
+    func makeBody(configuration: Configuration) -> some View { StyleBody(configuration: configuration, fill: fill) }
+    private struct StyleBody: View {
         let configuration: Configuration
         let fill: Bool
         @Environment(\.isEnabled) private var enabled

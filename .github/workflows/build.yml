@@ -45,6 +45,16 @@ jobs:
       - name: Build CyPort (no game, unsigned)
         run: NO_GAME=1 ./build.sh
 
+      - name: Check the IPA has its screens
+        # without them the app can only show "setup screen didn't load"
+        run: |
+          T="$RUNNER_TEMP/ipa"; rm -rf "$T"; mkdir -p "$T"; unzip -q build/CyPort-unsigned.ipa -d "$T"
+          L="$(find "$T" -name libMacShim.dylib | head -n 1)"
+          for c in MSInstallerUI MSSwiftLauncher MSStoreUI; do
+            strings -a "$L" | grep -qx "$c" || { echo "missing class $c in libMacShim.dylib"; exit 1; }
+          done
+          echo "all screens are in the app"
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
