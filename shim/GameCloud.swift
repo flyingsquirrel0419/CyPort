@@ -508,23 +508,64 @@ enum GOGCloud {
 // MARK: - Steam Cloud
 
 enum SteamCloud {
+    /// the save files in Steam Cloud. Asks with Cloud.EnumerateUserFiles (the service the Steam client uses now); the
+    /// old UFS file list as a fallback - it went unanswered for a user ("Steam didn't answer in time", 2026-11-15).
+    /// A request that times out is tried once more on a fresh connection.
     static func list() async throws -> [CloudFile] {
+        do { return try await listOnce() }
+        catch let e as StoreError where e.message.contains("in time") {
+            GameCloud.log("Steam: \(e.message) - connecting again and retrying")
+            return try await listOnce()
+        }
+    }
+    private static func listOnce() async throws -> [CloudFile] {
         try await SteamStore.shared.logOn()
-        let cm = SteamStore.shared.cm
+        let raw: [(name: String, when: UInt64)]
+        do { raw = try await enumerate() }
+        catch {
+            GameCloud.log("Steam: Cloud.EnumerateUserFiles: \(error.localizedDescription) - trying the old file list")
+            do { raw = try await ufsList() }
+            catch { GameCloud.log("Steam: UFS file list: \(error.localizedDescription)"); throw error }
+        }
+        var out: [CloudFile] = []
+        for (name, when) in raw {
+            guard let rel = GameCloud.slotPath(name) else { continue }
+            let short = name.hasPrefix("%") ? String(name.dropFirst().drop { $0 != "%" }.dropFirst()) : name
+            out.append(CloudFile(rel: rel, modified: Date(timeIntervalSince1970: TimeInterval(when)), remote: name) {
+                try await download(short != name && !short.isEmpty ? [name, short] : [name])
+            })
+        }
+        GameCloud.log("Steam: \(out.count) save file(s) in Steam Cloud (\(raw.count) file(s) in all)")
+        return out
+    }
+    private static func enumerate() async throws -> [(name: String, when: UInt64)] {
+        var out: [(String, UInt64)] = [], start = 0, total = Int.max
+        while start < total {
+            var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true); q.u(3, 500); q.u(4, UInt64(start))
+            let r = try await SteamStore.shared.cm.service("Cloud.EnumerateUserFiles#1", q, authed: true, timeout: 45)
+            let files = r.all(1)
+            total = Int(r.u(2) ?? UInt64(start + files.count))
+            for raw in files {
+                let f = try PBMessage(raw)
+                if let n = f.s(3) { out.append((n, f.u(4) ?? 0)) }
+            }
+            if files.isEmpty { break }
+            start += files.count
+        }
+        return out
+    }
+    private static func ufsList() async throws -> [(name: String, when: UInt64)] {
         var q = PBWriter(); q.u(1, UInt64(Game.steamApp)); q.b(2, true)
-        let p = try await cm.call(.clientUFSGetFileListForApp, q)
+        let p = try await SteamStore.shared.cm.call(.clientUFSGetFileListForApp, q, timeout: 45)
         let m = try PBMessage(p.body)
         let prefixes = m.all(2).map { String(decoding: $0, as: UTF8.self) }
-        var out: [CloudFile] = []
+        var out: [(String, UInt64)] = []
         for raw in m.all(1) {
             let f = try PBMessage(raw)
             guard let name = f.s(2), (f.u(6) ?? 0) == 0 else { continue }              // skip deleted files
             let prefix = f.u(8).flatMap { Int($0) < prefixes.count ? prefixes[Int($0)] : nil } ?? ""
-            guard let rel = GameCloud.slotPath(prefix + name) else { continue }
-            let when = Date(timeIntervalSince1970: TimeInterval(f.u(4) ?? 0))
-            out.append(CloudFile(rel: rel, modified: when, remote: prefix + name) { try await download(prefix.isEmpty ? [name] : [prefix + name, name]) })
+            out.append((prefix + name, f.u(4) ?? 0))
         }
-        GameCloud.log("Steam: \(out.count) save file(s) in Steam Cloud")
         return out
     }
     /// Steam Cloud upload, the way the Steam client does it: begin a batch, per file begin -> send its blocks to the

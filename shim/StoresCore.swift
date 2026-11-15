@@ -746,25 +746,35 @@ actor SteamCM {
         var d = Data(); d.appendLE(e.rawValue | 0x80000000); d.appendLE(UInt32(h.data.count)); d.append(h.data); d.append(body.data)
         try await ws.send(.data(d))
     }
+    private var jobNames: [UInt64: String] = [:]
     private func waitJob(_ job: UInt64, timeout: Double) async throws -> Packet {
         if var q = jobQueue[job], !q.isEmpty { let p = q.removeFirst(); jobQueue[job] = q; return p }
         if let failure { throw failure }
-        let timer = Task { try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9)); self.timeoutJob(job) }
+        let timer = Task { do { try await Task.sleep(nanoseconds: UInt64(timeout * 1e9)) } catch { return }; self.timeoutJob(job) }   // answered in time: not a timeout
         defer { timer.cancel() }
         return try await withCheckedThrowingContinuation { jobWaiters[job] = $0 }
     }
-    private func timeoutJob(_ job: UInt64) { jobWaiters.removeValue(forKey: job)?.resume(throwing: StoreError("Steam didn't answer in time")) }
+    private func timeoutJob(_ job: UInt64) {
+        guard let c = jobWaiters.removeValue(forKey: job) else { return }
+        let what = jobNames[job] ?? "request"
+        storeLog("steam: no answer to \(what) (job \(job))")
+        c.resume(throwing: StoreError("Steam didn't answer in time (\(what))"))
+    }
     private func waitEMsg(_ e: EMsg, timeout: Double) async throws -> Packet {
         if let failure { throw failure }
-        let timer = Task { try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9)); self.timeoutEMsg(e.rawValue) }
+        let timer = Task { do { try await Task.sleep(nanoseconds: UInt64(timeout * 1e9)) } catch { return }; self.timeoutEMsg(e.rawValue) }
         defer { timer.cancel() }
         return try await withCheckedThrowingContinuation { emsgWaiters[e.rawValue] = $0 }
     }
-    private func timeoutEMsg(_ e: UInt32) { emsgWaiters.removeValue(forKey: e)?.resume(throwing: StoreError("Steam didn't answer in time")) }
+    private func timeoutEMsg(_ e: UInt32) {
+        guard let c = emsgWaiters.removeValue(forKey: e) else { return }
+        storeLog("steam: no answer to message \(e)")
+        c.resume(throwing: StoreError("Steam didn't answer in time (message \(e))"))
+    }
 
     /// a request answered with a job reply (the reply's header names our job)
     func call(_ e: EMsg, _ body: PBWriter, timeout: Double = 30) async throws -> Packet {
-        let job = nextJob; nextJob += 1
+        let job = nextJob; nextJob += 1; jobNames[job] = "\(e)"
         try await send(e, body, job: job)
         return try await waitJob(job, timeout: timeout)
     }
@@ -777,7 +787,7 @@ actor SteamCM {
     }
     /// a unified service method ("Authentication.X#1"); returns the reply body or throws Steam's result
     func service(_ method: String, _ body: PBWriter, authed: Bool, timeout: Double = 30) async throws -> PBMessage {
-        let job = nextJob; nextJob += 1
+        let job = nextJob; nextJob += 1; jobNames[job] = method
         try await send(authed ? .serviceMethodCallFromClient : .serviceMethodCallFromClientNonAuthed, body, job: job, target: method,
                        steamID: authed ? nil : 0, session: authed ? nil : 0)
         let p = try await waitJob(job, timeout: timeout)
