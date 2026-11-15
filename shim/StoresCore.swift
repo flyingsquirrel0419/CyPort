@@ -167,7 +167,7 @@ final class NetMeter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 enum Net {
     static let session: URLSession = {
         let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 32; c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 16; c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
         return URLSession(configuration: c, delegate: NetMeter.shared, delegateQueue: nil)
     }()
@@ -334,9 +334,11 @@ final class Downloader: @unchecked Sendable {
     let plan: DLPlan, dest: URL
     /// how far ahead of the file being written chunks are fetched: up to this many requests, up to this many bytes
     /// (a slow chunk then doesn't drain the pipe - the others keep coming; was 8 chunks, too few for fast lines)
-    /// Steam's caches in Korea took 3-20 s per 1 MB chunk of the Mac game data (not in their cache, fetched from
-    /// further away), each request slow but many at once fine: so many at once (macshim.log, 2026-11-15)
-    var parallel = 128
+    /// requests at once: tuned while it runs (see `tune`). Steam's caches took 3-20 s per 1 MB chunk of the Mac game
+    /// data; 47 at once gave 1.5-2.7 MB/s, 128 at once less (timeouts, lost connections - a home router or the line
+    /// doesn't like that many), the game program 10 MB/s with the same settings (macshim.log, 2026-11-15)
+    var parallel = 24
+    let minParallel = 8, maxParallel = 96
     var aheadLimit = 320 << 20
     private let journalURL: URL
     private var journal: [String: Int64] = [:]           // path -> bytes known good (complete files: their size)
@@ -416,6 +418,19 @@ final class Downloader: @unchecked Sendable {
         defer { try? current?.close() }
         var qi = 0
         var waited = 0.0, statFrom = CFAbsoluteTimeGetCurrent(), statDone = done      // for the log: network or disk?
+        // hill climbing on the network rate every 15 s: keep going the way that made it faster, turn round otherwise
+        var tuneAt = CFAbsoluteTimeGetCurrent(), tuneNet = NetMeter.shared.snapshot.total, lastRate = 0.0, dir = 1
+        func tune() {
+            let now = CFAbsoluteTimeGetCurrent()
+            guard now - tuneAt >= 15 else { return }
+            let net = NetMeter.shared.snapshot.total
+            let rate = Double(net - tuneNet) / (now - tuneAt)
+            if lastRate > 0 && rate < lastRate * 1.05 { dir = -dir }
+            let was = parallel
+            parallel = min(maxParallel, max(minParallel, parallel + dir * 8))
+            storeLog(String(format: "download: %.2f MB/s from the network with %d requests at once -> %d", rate / 1e6, was, parallel))
+            lastRate = rate; tuneAt = now; tuneNet = net
+        }
         // files that already finished (or are empty) still need to exist
         for s in starts where plan.files[s.file].parts.isEmpty || s.part == plan.files[s.file].parts.count {
             let u = dest.appendingPathComponent(plan.files[s.file].path)
@@ -424,6 +439,7 @@ final class Downloader: @unchecked Sendable {
         }
         while qi < queue.count {
             try Task.checkCancellation()
+            tune()
             pump()
             let (fi, pi) = queue[qi]; let f = plan.files[fi], part = f.parts[pi]
             if fi != currentFile {
@@ -1077,7 +1093,7 @@ final class HostPool: @unchecked Sendable {
     private var hs: [H]
     private let l = NSLock()
     private var lastLog = CFAbsoluteTimeGetCurrent()
-    init(_ hosts: [String]) { hs = hosts.prefix(16).map { H(name: $0) } }
+    init(_ hosts: [String]) { hs = hosts.prefix(8).map { H(name: $0) } }
     func take() -> String {
         l.lock(); defer { l.unlock() }
         let now = CFAbsoluteTimeGetCurrent()
