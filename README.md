@@ -115,9 +115,11 @@ GitHub Actions (`.github/workflows/build.yml`) builds CyPort **without the game*
    Either way CyPort converts it for iOS on the phone (`shim/MachORetarget.swift` – the same changes as
    `tools/ios_retarget.py --game-folder`, byte for byte: `tools/test_retarget.sh`) and writes `CyPort-<version>.ipa`
    (also in *Files → On My iPhone → CyPort*).
-3. **Install…** → choose SideStore (or LiveContainer, AltStore, TrollStore) and install it **over** the first one. iOS only
+3. **Game data**: the next step downloads it (Steam, GOG or Epic) into CyPort's files right away – or **Later**, after
+   installing. It stays when the app is installed over.
+4. **Install…** → choose SideStore (or LiveContainer, AltStore, TrollStore) and install it **over** the first one. iOS only
    runs code signed into an installed app, so this step can't be skipped; it's the same app, so its files and sign-ins stay.
-4. Open CyPort again: it now has the game program and asks for the game data – **Download from Steam, GOG or Epic…**.
+5. Open CyPort again: it plays (or, with the data left for later, asks for it – **Download from Steam, GOG or Epic…**).
 
 Steam always serves its newest Mac build; the shim knows **Steam 2.5.0** (see Requirements). A newer build may need a
 newer CyPort.

@@ -51,6 +51,9 @@ final class StoreModel: ObservableObject {
     @Published var needBytes: Int64 = 0
     @Published var freeBytes: Int64 = 0
     private var task: Task<Void, Never>?
+    /// set by the setup screen (InstallerUI.swift): the data is downloaded before the app with the game program is
+    /// installed; when it's there, Continue goes back to the setup instead of "Close the app"
+    var afterDone: (() -> Void)?
 
     init(downloadRoot: URL, internalRoot: URL, bookmarkKey: String, updateRoot: URL? = nil) {
         self.downloadRoot = downloadRoot; self.internalRoot = internalRoot; self.bookmarkKey = bookmarkKey; self.updateRoot = updateRoot
@@ -182,6 +185,8 @@ struct StoreView: View {
                     }
                     Text(model.updateRoot != nil
                          ? "This CyPort plays Cyberpunk \(GameData.appVersionName). Sign in to GOG or Steam (where you bought it): CyPort checks your game files and downloads only the ones that are missing or from another version. Steam or PC copies work too: the Mac version comes with your purchase."
+                         : model.afterDone != nil
+                         ? "Sign in to the store you got the game program from (Steam: the same account). CyPort downloads the Mac version's game data (about 65–90 GB) onto this iPhone. It stays when you install the app with the game program over this one."
                          : "Sign in to the store where you bought Cyberpunk 2077. CyPort downloads the Mac version's game data (about 90 GB with Phantom Liberty). Your app already contains the game program (Cyberpunk \(GameData.appVersionName)).")
                         .font(.subheadline).foregroundColor(.gray)
                     content
@@ -210,8 +215,13 @@ struct StoreView: View {
         case .downloading: downloadingView
         case .done(let m):
             CyHeading(text: "Done", icon: "checkmark.seal")
-            Text(m).foregroundColor(.white)
-            Button("Close the app") { exit(0) }.buttonStyle(CyPrimaryButtonStyle())
+            if let next = model.afterDone {
+                Text("The game data is ready.").foregroundColor(.white)
+                Button("Continue") { next() }.buttonStyle(CyPrimaryButtonStyle())
+            } else {
+                Text(m).foregroundColor(.white)
+                Button("Close the app") { exit(0) }.buttonStyle(CyPrimaryButtonStyle())
+            }
         }
     }
 

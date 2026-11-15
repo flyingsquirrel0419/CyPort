@@ -2,6 +2,8 @@
 // program, then the same conversion (GameInstaller.swift) into an IPA to install over this app:
 //   - Steam: sign in, download the Mac game program (Apple Silicon) from the account that owns the game
 //   - your own copy (CyPort's original way): pick the Mac game's Cyberpunk2077.app in Files
+// Three steps: 1 game program -> 2 game data (the normal store download into Documents, which stays when the app is
+// installed over) -> 3 install the IPA (iOS only runs code signed into an installed app, so that can't be skipped).
 // Opened by the shim's starter (MacShimMain in MacShim.m) when the app has no Games/<version>/. Looks like the start
 // screen (CyStyle.swift).
 import SwiftUI
@@ -28,7 +30,8 @@ final class InstallerModel: ObservableObject {
     enum Phase {
         case start, working(String), ready(GameInstaller.Prepared), downloading
         case local(GameInstaller.Local, URL)            // a picked copy, checked; URL = the security-scoped pick
-        case done(GameInstaller.Result), failed(String)
+        case data(GameInstaller.Result)                // step 2: the game data
+        case done(GameInstaller.Result), failed(String) // done = step 3: install
     }
     @Published var source: Source = .steam
     @Published var phase: Phase = .start
@@ -41,12 +44,25 @@ final class InstallerModel: ObservableObject {
         // an IPA written earlier (the app was closed before installing it): offer it again
         if let ipa = Self.existingIPA(i.outDir) {
             let size = (try? FileManager.default.attributesOfItem(atPath: ipa.path)[.size] as? NSNumber)?.int64Value ?? 0
-            phase = .done(.init(ipa: ipa, version: String(ipa.deletingPathExtension().lastPathComponent.dropFirst("CyPort-".count)), size: size, log: []))
+            let r = GameInstaller.Result(ipa: ipa, version: String(ipa.deletingPathExtension().lastPathComponent.dropFirst("CyPort-".count)), size: size, log: [])
+            phase = Self.hasData ? .done(r) : .data(r)
         }
     }
     static func existingIPA(_ dir: URL) -> URL? {
         ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
             .first { $0.lastPathComponent.hasPrefix("CyPort-") && $0.pathExtension == "ipa" }
+    }
+    /// the game data where the game looks for it (MSDataRoot in MacShim.m): Documents/Cyberpunk 2077, or a folder picked on the
+    /// store screen ("A folder (SSD)…")
+    static var docs: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
+    static let dataBookmarkKey = "MacShimDataBookmark2"
+    static var hasData: Bool {
+        let root = docs.appendingPathComponent("Cyberpunk 2077")
+        let inDocs = ["archive", "engine", "r6"].allSatisfy { var d: ObjCBool = false; return FileManager.default.fileExists(atPath: root.appendingPathComponent($0).path, isDirectory: &d) && d.boolValue }
+        return inDocs || UserDefaults.standard.data(forKey: dataBookmarkKey) != nil
+    }
+    var step: Int {
+        switch phase { case .data: return 2; case .done: return 3; default: return 1 }
     }
     var busy: Bool { switch phase { case .working, .downloading: return true; default: return false } }
 
@@ -102,7 +118,10 @@ final class InstallerModel: ObservableObject {
         let id = bg
         task = Task {
             defer { UIApplication.shared.isIdleTimerDisabled = false; UIApplication.shared.endBackgroundTask(id) }
-            do { phase = .done(try await Task.detached(priority: .userInitiated) { try await work() }.value) }
+            do {
+                let r = try await Task.detached(priority: .userInitiated) { try await work() }.value
+                phase = Self.hasData ? .done(r) : .data(r)
+            }
             catch is CancellationError { cancelled() }
             catch { fail(error) }
         }
@@ -114,6 +133,7 @@ final class InstallerModel: ObservableObject {
     func cancel() { task?.cancel() }
     func startOver() {
         if case .done(let r) = phase { try? FileManager.default.removeItem(at: r.ipa) }
+        if case .data(let r) = phase { try? FileManager.default.removeItem(at: r.ipa) }
         phase = .start
     }
 }
@@ -123,13 +143,15 @@ struct InstallerView: View {
     @State private var login = false
     @State private var picking = false
     @State private var share: SharedFile?
+    @State private var dataStore: StoreModel?
 
     var body: some View {
         ZStack {
             CyBackground()
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 20) {
-                    CyTitle(subtitle: "Set up · get the game program")
+                    CyTitle(subtitle: "Set up CyPort")
+                    steps
                     content
                 }
                 .padding(.horizontal, 24).padding(.vertical, 28)
@@ -142,6 +164,7 @@ struct InstallerView: View {
         .statusBarHidden(true)
         .sheet(isPresented: $login) { LoginSheet(store: .steam) { login = false; model.refresh += 1 } }
         .sheet(item: $share) { f in ShareSheet(url: f.url) }
+        .fullScreenCover(item: $dataStore) { m in StoreView(model: m) }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.folder, .applicationBundle], allowsMultipleSelection: false) { model.picked($0) }
     }
 
@@ -153,6 +176,7 @@ struct InstallerView: View {
         case .ready(let p): ready(p)
         case .downloading: downloading
         case .local(let l, let u): local(l, u)
+        case .data(let r): data(r)
         case .done(let r): done(r)
         case .failed(let m):
             VStack(alignment: .leading, spacing: 14) {
@@ -167,7 +191,7 @@ struct InstallerView: View {
 
     var choose: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("This CyPort doesn't have the game program yet. Choose where it comes from: CyPort prepares it for iOS on this phone and makes an app to install over this one.")
+            Text("First the game program (the part that runs): choose where it comes from. CyPort prepares it for iOS on this phone. Then the game data, then you install the finished app.")
                 .font(.subheadline).foregroundStyle(.white.opacity(0.7)).fixedSize(horizontal: false, vertical: true)
             option(.steam, icon: "cloud", title: "Steam", detail: "Sign in with the account that owns Cyberpunk 2077. CyPort downloads the game program (a few hundred MB).")
             option(.local, icon: "folder", title: "Your own copy", detail: "CyPort's original way: the Mac version's Cyberpunk2077.app that you already have, in Files (on the phone, iCloud Drive or a drive).")
@@ -175,7 +199,6 @@ struct InstallerView: View {
                 if model.source == .steam { steamPanel } else { localPanel }
             }
             .animation(.easeOut(duration: 0.15), value: model.source)
-            Text("The game data (about 65–90 GB) comes after installing, on CyPort's next screen.").cyNote()
         }
     }
     func option(_ s: InstallerModel.Source, icon: String, title: String, detail: String) -> some View {
@@ -264,7 +287,7 @@ struct InstallerView: View {
             row("Found", l.app.deletingLastPathComponent().lastPathComponent + "/" + l.app.lastPathComponent)
             row("Version", l.short)
             if l.hasData {
-                Text("The game data is in the same folder: after installing, pick this folder again on CyPort's next screen.").cyNote()
+                Text("The game data is in the same folder too: after installing, pick this folder on CyPort's first screen (Import or Play from a folder).").cyNote()
             }
             HStack(spacing: 12) {
                 Button("Back") { model.back() }.buttonStyle(CySecondaryButtonStyle())
@@ -274,20 +297,47 @@ struct InstallerView: View {
         }.cyCard()
     }
 
-    // MARK: done
+    // MARK: step 2: game data
+
+    func data(_ r: GameInstaller.Result) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                CyHeading(text: "Game program ready", icon: "checkmark.seal")
+                row("Cyberpunk", r.version)
+                Text("Now the game data: the maps, sounds and videos (about 65–90 GB). It goes into CyPort's files on this iPhone (or a drive you pick) and stays there when you install the finished app.")
+                    .font(.subheadline).foregroundStyle(.white.opacity(0.8)).fixedSize(horizontal: false, vertical: true)
+            }.cyCard()
+            Button {
+                let m = StoreModel(downloadRoot: InstallerModel.docs.appendingPathComponent("Cyberpunk 2077 (downloading)"),
+                                   internalRoot: InstallerModel.docs.appendingPathComponent("Cyberpunk 2077"),
+                                   bookmarkKey: InstallerModel.dataBookmarkKey)
+                m.afterDone = { dataStore = nil; model.phase = .done(r) }
+                dataStore = m
+            } label: { Label("Download the game data", systemImage: "arrow.down.circle") }
+                .buttonStyle(CyPrimaryButtonStyle(fill: true))
+            Button("Later – install the app first") { model.phase = .done(r) }
+                .buttonStyle(CySecondaryButtonStyle(fill: true))
+            Text("Already have the game data in Files or on a drive? Choose Later: after installing, CyPort's first screen imports it or plays from that folder.").cyNote()
+        }
+    }
+
+    // MARK: step 3: install
 
     func done(_ r: GameInstaller.Result) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 12) {
-                CyHeading(text: "Ready to install", icon: "checkmark.seal")
+                CyHeading(text: "Last step: install", icon: "square.and.arrow.down")
+                Text("iOS only runs game code that is inside an installed app. CyPort has put the game program into a new copy of itself – install it over this one.")
+                    .font(.subheadline).foregroundStyle(.white.opacity(0.8)).fixedSize(horizontal: false, vertical: true)
                 row("App", r.ipa.lastPathComponent)
                 row("Size", gb(r.size, 2))
-                Text("Also in Files → On My iPhone → CyPort.").cyNote()
+                row("Game data", InstallerModel.hasData ? "ready ✓" : "after installing")
             }.cyCard()
             VStack(alignment: .leading, spacing: 10) {
                 step(1, "Tap Install and choose SideStore (or LiveContainer, AltStore, TrollStore).")
-                step(2, "Install it over this app – same app: your sign-ins and files stay.")
-                step(3, "Open CyPort again: it asks for the game data next.")
+                step(2, "Install it over this app – same app: your sign-ins and game data stay.")
+                step(3, InstallerModel.hasData ? "Open CyPort again and play." : "Open CyPort again: it asks for the game data.")
+                Text("The app file is also in Files → On My iPhone → CyPort; delete it after installing.").cyNote()
                 Text("Free Apple ID: the app needs the Increased Memory Limit – see GetMoreRam in the README.").cyNote()
             }
             Button { share = SharedFile(url: r.ipa) } label: { Label("Install…", systemImage: "square.and.arrow.up") }
@@ -297,6 +347,25 @@ struct InstallerView: View {
     }
 
     // MARK: bits
+
+    /// 1 GAME PROGRAM · 2 GAME DATA · 3 INSTALL
+    var steps: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(["Program", "Data", "Install"].enumerated()), id: \.offset) { i, t in
+                let n = i + 1, cur = model.step
+                HStack(spacing: 6) {
+                    Text(n < cur ? "✓" : "\(n)").font(.system(size: 12, weight: .heavy, design: .monospaced))
+                        .foregroundStyle(n <= cur ? .black : .white.opacity(0.5))
+                        .frame(width: 20, height: 20)
+                        .background(n <= cur ? cyberYellow : .white.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+                    Text(t.uppercased()).font(.system(size: 11, weight: .heavy, design: .monospaced)).tracking(1)
+                        .foregroundStyle(n == cur ? cyberYellow : .white.opacity(n < cur ? 0.7 : 0.35))
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                }
+                if n < 3 { Rectangle().fill(n < cur ? cyberYellow.opacity(0.7) : .white.opacity(0.15)).frame(height: 1).frame(maxWidth: .infinity) }
+            }
+        }
+    }
 
     func row(_ k: String, _ v: String) -> some View {
         HStack(alignment: .firstTextBaseline) {
@@ -321,3 +390,6 @@ struct ShareSheet: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: [url], applicationActivities: nil) }
     func updateUIViewController(_ v: UIActivityViewController, context: Context) {}
 }
+
+/// the setup screen opens the store screen with .fullScreenCover(item:)
+extension StoreModel: Identifiable {}
