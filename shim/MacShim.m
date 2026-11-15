@@ -1001,7 +1001,7 @@ __attribute__((visibility("default"))) void NSRectFill(CGRect r) { (void)r; }
  * TVOut = NO in macshim.plist turns this off. */
 static UIWindow *g_tvWin; static UIView *g_tvPad;
 static CGFloat g_stickR = 60;                    /* on-screen stick radius (PadLayout: smaller on small screens) */
-static double g_stBottomGap = 4;                 /* the FPS overlay's distance from the bottom edge (above a home bar) */
+static double g_stTopGap = 4;                    /* the FPS overlay's distance from the top edge (below a notch / island) */
 /* Mirror: every frame the game presents is also copied (one GPU blit, same command queue, right after the game's
    command buffer) into a Metal layer on the phone, so the picture is on both screens. Touches map onto the picture. */
 static BOOL MSMirrorFit(UIView *v, CGRect *r) {
@@ -1104,7 +1104,7 @@ static void MSTVRoute(void) {                                     /* main thread
         MSLogf(@"screen: game picture %.0fx%.0f pt fitted to the phone's %.0fx%.0f pt at %.0f,%.0f (scale %.3f)", g_sw, g_sh,
                phone.bounds.size.width, phone.bounds.size.height, host.frame.origin.x, host.frame.origin.y, host.transform.a);
     }
-    g_stBottomGap = phone.safeAreaInsets.bottom > 0 ? 16 : 4;
+    g_stTopGap = phone.safeAreaInsets.top + 4;
     MSLogScreens(@"route");
 }
 static void MSTVObserve(void) {
@@ -4273,14 +4273,16 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     } else {
         if (CGSizeEqualToSize(S, _laidOut) && !force) return; _laidOut = S;
         UIEdgeInsets in = self.safeAreaInsets; CGFloat L = MAX(in.left, 16), R = S.width - MAX(in.right, 16), H = S.height - MAX(in.bottom, 8), T = MAX(in.top, 8);
+        CGFloat B = T + MS_PAD_OVERLAY_H;
         pos = @{
             @"A": @[ @(R - 85), @(H - 40), @27 ],  @"B": @[ @(R - 35), @(H - 90), @27 ],  @"X": @[ @(R - 135), @(H - 90), @27 ], @"Y": @[ @(R - 85), @(H - 140), @27 ],
             @"RT": @[ @(R - 40), @(T + 40), @30 ], @"RB": @[ @(R - 115), @(T + 34), @24 ],
             @"LT": @[ @(L + 40), @(T + 40), @30 ], @"LB": @[ @(L + 115), @(T + 34), @24 ],
             @"L3": @[ @(L + 24), @(H - 24), @20 ], @"R3": @[ @(R - 170), @(H - 22), @20 ],
-            @"▲": @[ @(L + 190), @(T + 22), @16 ], @"▼": @[ @(L + 190), @(T + 86), @16 ], @"◀": @[ @(L + 158), @(T + 54), @16 ], @"▶": @[ @(L + 222), @(T + 54), @16 ],
-            @"⧉": @[ @(S.width / 2 - 55), @(T + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(T + 20), @17 ], @"🎮": @[ @(S.width / 2), @(T + 20), @17 ],
-            @"Esc": @[ @(S.width / 2 - 120), @(T + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(T + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(T + 20), @21 ],
+            /* B: the top band starts below the performance overlay (FPS pill, top centre) */
+            @"▲": @[ @(L + 190), @(B + 22), @16 ], @"▼": @[ @(L + 190), @(B + 86), @16 ], @"◀": @[ @(L + 158), @(B + 54), @16 ], @"▶": @[ @(L + 222), @(B + 54), @16 ],
+            @"⧉": @[ @(S.width / 2 - 55), @(B + 20), @17 ], @"≡": @[ @(S.width / 2 + 55), @(B + 20), @17 ], @"🎮": @[ @(S.width / 2), @(B + 20), @17 ],
+            @"Esc": @[ @(S.width / 2 - 120), @(B + 20), @19 ], @"Space": @[ @(S.width / 2 + 120), @(B + 20), @21 ], @"Enter": @[ @(S.width / 2 + 175), @(B + 20), @21 ],
         };
         _lHome = CGPointMake(L + 115, H - 105); _rHome = CGPointMake(-1000, -1000);   /* no fixed right stick: the right side is the camera */
         _faceC = CGPointMake(R - 85, H - 90); _faceGap = 50; _faceR = 27;               /* the A/B/X/Y diamond's centre (see pos) */
@@ -4288,7 +4290,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     }
     {   /* the layout editor's own buttons, then the player's saved layout for this screen size (✎ editor) */
         NSMutableDictionary *m = [pos mutableCopy]; CGFloat top = MAX(self.safeAreaInsets.top, 8);
-        m[@"✎"] = @[ @(S.width / 2), @(top + 58), @15 ];
+        m[@"✎"] = @[ @(S.width / 2), @(top + 58 + MS_PAD_OVERLAY_H), @15 ];
         NSArray *tools = @[ @"−", @"+", @"↺", @"✓" ];
         for (NSUInteger i = 0; i < tools.count; i++) m[tools[i]] = @[ @(S.width / 2 - 105 + 70 * (double)i), @(S.height / 2), @24 ];
         NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:[self msLayoutKey]];
@@ -5236,7 +5238,7 @@ static void MSStartReadProgress(void) {
                 CGFloat pw = ov == 2 ? 400 : 210;
                 [CATransaction begin]; [CATransaction setDisableActions:YES];
                 CGRect R = g_stRoot.bounds;
-                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, R.size.height - 20 - g_stBottomGap, pw, 20); g_stBg.cornerRadius = 10;
+                g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, g_stTopGap, pw, 20);       /* top centre (the keys there sit below it) */ g_stBg.cornerRadius = 10;
                 g_stBg.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45].CGColor;
                 g_stTitle.hidden = g_stLog.hidden = g_stTrack.hidden = YES;
                 g_stHead.frame = CGRectMake(10, 2, pw - 20, 16); g_stHead.alignmentMode = kCAAlignmentCenter; g_stHead.fontSize = 11; g_stHead.string = f;
