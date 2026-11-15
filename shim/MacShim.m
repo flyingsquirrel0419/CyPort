@@ -6020,7 +6020,12 @@ __attribute__((visibility("default"))) int MacShimMain(int argc, char **argv) {
     NSMutableArray *names = [NSMutableArray array]; for (NSDictionary *v in vers) [names addObject:v[@"plist"][@"version"] ?: @"?"];
     MSLogf(@"starter: game versions in this app: %@ - starting %@ (%@)", [names componentsJoinedByString:@", "], pick[@"plist"][@"version"], why);
     void *h = dlopen(dylib.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
-    if (!h) { MSLogf(@"starter: could not load %@: %s", dylib, dlerror()); abort(); }
+    if (!h) {                 /* e.g. an app made on the phone without a valid signature: back to the setup screen, not a crash */
+        const char *e = dlerror(); MSLogf(@"starter: could not load %@: %s", dylib, e);
+        setenv("CYPORT_LOAD_ERROR", e ?: "unknown error", 1);
+        @autoreleasepool { UIApplicationMain(argc, argv, nil, NSStringFromClass([MSInstallerDelegate class])); }
+        exit(0);
+    }
     for (uint32_t k = 0; k < _dyld_image_count(); k++) {
         const char *n = _dyld_get_image_name(k);
         if (n && strstr(n, "/CyberpunkGame.dylib") && strstr(n, g_gameDir.lastPathComponent.UTF8String)) { g_gameHeader = _dyld_get_image_header(k); break; }

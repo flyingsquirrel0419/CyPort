@@ -37,10 +37,20 @@ final class InstallerModel: ObservableObject {
     @Published var phase: Phase = .start
     @Published var progress: Downloader.Progress?
     @Published var refresh = 0
+    /// the app has a game program but it didn't load (MacShimMain set CYPORT_LOAD_ERROR): make it again
+    @Published var loadError: String?
     let installer: GameInstaller
     private var task: Task<Void, Never>?
     init(_ i: GameInstaller) {
         installer = i
+        if let e = ProcessInfo.processInfo.environment["CYPORT_LOAD_ERROR"] {
+            loadError = e.contains("code signature") ? "The game program in this app isn't signed correctly (an app made by an older CyPort). Make it again: it takes a minute." : "The game program in this app didn't load. Make it again."
+            // the app made from it is the broken one: don't offer it again
+            for f in (try? FileManager.default.contentsOfDirectory(at: i.outDir, includingPropertiesForKeys: nil)) ?? []
+                where f.lastPathComponent.hasPrefix("CyPort-") && f.pathExtension == "ipa" { try? FileManager.default.removeItem(at: f) }
+            storeLog("installer: opened because the game program didn't load - old IPAs removed")
+            return
+        }
         // an IPA written earlier (the app was closed before installing it): offer it again
         if let ipa = Self.existingIPA(i.outDir) {
             let size = (try? FileManager.default.attributesOfItem(atPath: ipa.path)[.size] as? NSNumber)?.int64Value ?? 0
@@ -193,6 +203,13 @@ struct InstallerView: View {
 
     var choose: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let e = model.loadError {
+                VStack(alignment: .leading, spacing: 8) {
+                    CyHeading(text: "Make the app again", icon: "exclamationmark.triangle")
+                    Text(e).font(.subheadline).foregroundStyle(.white.opacity(0.85)).fixedSize(horizontal: false, vertical: true)
+                    Text("Your downloaded game data stays.").cyNote()
+                }.cyCard(selected: true)
+            }
             Text("First the game program (the part that runs): choose where it comes from. CyPort prepares it for iOS on this phone. Then the game data, then you install the finished app.")
                 .font(.subheadline).foregroundStyle(.white.opacity(0.7)).fixedSize(horizontal: false, vertical: true)
             option(.steam, icon: "cloud", title: "Steam", detail: "Sign in with the account that owns Cyberpunk 2077. CyPort downloads the game program (a few hundred MB).")

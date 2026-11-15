@@ -167,7 +167,7 @@ final class NetMeter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 enum Net {
     static let session: URLSession = {
         let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 24; c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 32; c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
         return URLSession(configuration: c, delegate: NetMeter.shared, delegateQueue: nil)
     }()
@@ -334,8 +334,10 @@ final class Downloader: @unchecked Sendable {
     let plan: DLPlan, dest: URL
     /// how far ahead of the file being written chunks are fetched: up to this many requests, up to this many bytes
     /// (a slow chunk then doesn't drain the pipe - the others keep coming; was 8 chunks, too few for fast lines)
-    var parallel = 48
-    var aheadLimit = 128 << 20
+    /// Steam's caches in Korea took 3-20 s per 1 MB chunk of the Mac game data (not in their cache, fetched from
+    /// further away), each request slow but many at once fine: so many at once (macshim.log, 2026-11-15)
+    var parallel = 128
+    var aheadLimit = 320 << 20
     private let journalURL: URL
     private var journal: [String: Int64] = [:]           // path -> bytes known good (complete files: their size)
     private let lock = NSLock()
@@ -1075,7 +1077,7 @@ final class HostPool: @unchecked Sendable {
     private var hs: [H]
     private let l = NSLock()
     private var lastLog = CFAbsoluteTimeGetCurrent()
-    init(_ hosts: [String]) { hs = hosts.prefix(12).map { H(name: $0) } }
+    init(_ hosts: [String]) { hs = hosts.prefix(16).map { H(name: $0) } }
     func take() -> String {
         l.lock(); defer { l.unlock() }
         let now = CFAbsoluteTimeGetCurrent()
