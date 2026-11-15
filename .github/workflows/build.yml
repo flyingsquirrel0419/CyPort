@@ -57,6 +57,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: build/CyPort-unsigned.ipa
+          prerelease: ${{ contains(github.ref_name, '-') }}   # v1.4-steam.1 etc.
           body: |
             Unsigned CyPort without the game. Install it with SideStore / AltStore / LiveContainer, open it, sign in to
             Steam with the account that owns Cyberpunk 2077 and follow the setup screen (see README, "No Mac").
+            Pre-releases (tags with a "-") are not tested on a device yet.
