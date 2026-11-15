@@ -167,7 +167,7 @@ final class NetMeter: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
 enum Net {
     static let session: URLSession = {
         let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 16; c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.timeoutIntervalForRequest = 60; c.httpMaximumConnectionsPerHost = 24; c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
         return URLSession(configuration: c, delegate: NetMeter.shared, delegateQueue: nil)
     }()
@@ -332,7 +332,10 @@ final class Downloader: @unchecked Sendable {
     private func setLive(_ d: Int64, _ f: String?) { lock.lock(); liveDone = d; if let f { liveFile = f }; lock.unlock() }
     private func live() -> (Int64, String) { lock.lock(); defer { lock.unlock() }; return (liveDone, liveFile) }
     let plan: DLPlan, dest: URL
-    var parallel = 8
+    /// how far ahead of the file being written chunks are fetched: up to this many requests, up to this many bytes
+    /// (a slow chunk then doesn't drain the pipe - the others keep coming; was 8 chunks, too few for fast lines)
+    var parallel = 48
+    var aheadLimit = 128 << 20
     private let journalURL: URL
     private var journal: [String: Int64] = [:]           // path -> bytes known good (complete files: their size)
     private let lock = NSLock()
@@ -380,10 +383,11 @@ final class Downloader: @unchecked Sendable {
         var queue: [(file: Int, part: Int)] = []
         for s in starts { for p in s.part..<plan.files[s.file].parts.count { queue.append((s.file, p)) } }
         var ahead = 0                                       // next queue index to start fetching
+        var aheadBytes = 0                                  // bytes of the parts in queue[qi..<ahead]
         func pump() {
-            while ahead < queue.count && inflight.count < parallel {
-                let c = plan.files[queue[ahead].file].parts[queue[ahead].part].chunk
-                ahead += 1
+            while ahead < queue.count && inflight.count < parallel && aheadBytes < aheadLimit {
+                let pa = plan.files[queue[ahead].file].parts[queue[ahead].part], c = pa.chunk
+                ahead += 1; aheadBytes += pa.length
                 if cache[c] != nil || inflight[c] != nil { continue }
                 inflight[c] = Task { try await fetch(c) }
             }
@@ -442,6 +446,7 @@ final class Downloader: @unchecked Sendable {
             do { try current!.write(contentsOf: data.subdata(in: part.offset..<(part.offset + part.length))) }
             catch { throw StoreError("Writing \(f.path) failed: \(error.localizedDescription). Is the storage full?") }
             done += Int64(part.length)
+            if qi < ahead { aheadBytes -= part.length }
             setLive(done, f.path)
             fileWritten += Int64(part.length)
             setJournal(f.path, fileWritten)
@@ -963,11 +968,15 @@ final class SteamStore: @unchecked Sendable {
         let picked = try GameFiles.pick(files, scope: scope)
         let pickedLinks = GameFiles.pickLinks(links, files: files, scope: scope)
         let refs = chunks, ks = keys, hosts = servers.map(\.host)
+        // the best few servers (Steam sorts them: closest / least loaded first) share the chunks; the rest only on retries.
+        // Spreading over all of them (up to 20, some far away) made the slowest ones hold the download up.
+        let best = Array(hosts.prefix(4))
         let counter = Counter()
         return DLPlan(files: picked, chunkCount: refs.count, version: scope == .data ? "steam-\(build)" : "steam-\(build)-\(scope)", versionName: "Steam build \(build)", fetch: { i in
             let c = refs[i]; var last: Error = StoreError("chunk")
             for attempt in 0..<6 {
-                let host = hosts[(counter.next() + attempt) % hosts.count]
+                let n = counter.next()
+                let host = attempt < 2 ? best[(n + attempt) % best.count] : hosts[(n + attempt) % hosts.count]
                 do {
                     let enc = try await Net.request(URL(string: "https://\(host)/depot/\(c.depot)/chunk/\(c.sha.hex)")!, tries: 1)
                     let plain = try Self.decodeChunk(enc, key: ks[c.depot]!, size: c.size)
