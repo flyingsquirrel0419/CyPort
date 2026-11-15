@@ -106,9 +106,13 @@ Two ways: **with a Mac** (below), or **without one** – see [No Mac](#no-mac-gi
 GitHub Actions (`.github/workflows/build.yml`) builds CyPort **without the game**: `NO_GAME=1 ./build.sh` →
 `CyPort-unsigned.ipa` (the workflow's artifact; on a `v*` tag also a release). It contains no game files.
 1. Install `CyPort-unsigned.ipa` with SideStore / AltStore / LiveContainer (free Apple ID: also the GetMoreRam steps below).
-2. Open it: the **Set up CyPort** screen. Sign in to **Steam** with the account that owns Cyberpunk 2077 (password + Steam
-   Guard, as in the in-app download) → **Get the game** → **Download**. CyPort downloads only the Mac game program
-   (`Cyberpunk2077.app`, Apple Silicon), converts it for iOS on the phone (`shim/MachORetarget.swift` – the same changes as
+2. Open it: the setup screen. Choose where the game program comes from:
+   - **Steam** – sign in with the account that owns Cyberpunk 2077 (password + Steam Guard, as in the in-app download)
+     → **Get the game** → **Download**: CyPort downloads only the Mac game program (`Cyberpunk2077.app`, Apple Silicon).
+   - **Your own copy** (CyPort's original way) – **Pick the game…**: the Mac version's `Cyberpunk2077.app` (or the game
+     folder holding it) in Files, on the phone, iCloud Drive or a USB drive → **Convert**.
+
+   Either way CyPort converts it for iOS on the phone (`shim/MachORetarget.swift` – the same changes as
    `tools/ios_retarget.py --game-folder`, byte for byte: `tools/test_retarget.sh`) and writes `CyPort-<version>.ipa`
    (also in *Files → On My iPhone → CyPort*).
 3. **Install…** → choose SideStore (or LiveContainer, AltStore, TrollStore) and install it **over** the first one. iOS only

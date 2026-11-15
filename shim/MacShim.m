@@ -1605,7 +1605,7 @@ static NSString *MSGB(uint64_t b) { return [NSString stringWithFormat:@"%.1f GB"
         NSFileManager *fm = NSFileManager.defaultManager;
         if ([fm fileExistsAtPath:[u.path stringByAppendingPathComponent:@"archive/pc"]] && ![fm fileExistsAtPath:[u.path stringByAppendingPathComponent:@"archive/Mac"]]) {
             MSLogf(@"setup: picked folder is a Windows copy (archive/pc, no archive/Mac) - not imported");
-            _status.text = @"That's the Windows version of the game. CyPort needs the Mac version's files, which come with your Steam or GOG purchase: tap \"Download from Steam, GOG or Epic…\", or copy the Mac version from a Mac.";
+            _status.text = @"That's the Windows version of the game. CyPort needs the Mac version's files, which come with your Steam or GOG purchase: tap \"Download from Steam, GOG or Epic…\".";
             [u stopAccessingSecurityScopedResource]; return;
         }
     }
@@ -5979,7 +5979,7 @@ extern char **environ;
     if (!vc) {                                        /* a shim built without the Swift screens */
         vc = [UIViewController new]; vc.view.backgroundColor = UIColor.blackColor;
         UILabel *l = [UILabel new]; l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; l.textColor = UIColor.whiteColor;
-        l.text = @"This CyPort has no game program.\nBuild it with build.sh from your own copy of Cyberpunk 2077 (see README).";
+        l.text = @"This CyPort has no game program and its setup screen didn't load.\nInstall the CyPort IPA again.";
         l.translatesAutoresizingMaskIntoConstraints = NO; [vc.view addSubview:l];
         [NSLayoutConstraint activateConstraints:@[ [l.centerXAnchor constraintEqualToAnchor:vc.view.centerXAnchor], [l.centerYAnchor constraintEqualToAnchor:vc.view.centerYAnchor],
                                                    [l.widthAnchor constraintLessThanOrEqualToAnchor:vc.view.widthAnchor constant:-48] ]];

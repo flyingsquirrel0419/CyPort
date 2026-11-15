@@ -4,9 +4,7 @@
 import SwiftUI
 import UIKit
 
-private let cyberYellow = Color(red: 0.99, green: 0.93, blue: 0.04)
-
-private let cyberRed = Color(red: 1.0, green: 0.0, blue: 0.24)
+// cyberYellow, cyberRed, CyBackground: CyStyle.swift
 
 private final class LauncherModel: ObservableObject {
     let resolutions: [String]
@@ -345,11 +343,7 @@ private struct LauncherView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(colors: [Color.black, Color(red: 0.08, green: 0.02, blue: 0.06)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                .ignoresSafeArea()
-            // thin neon accents
-            VStack { Rectangle().fill(cyberYellow).frame(height: 3); Spacer(); Rectangle().fill(cyberRed.opacity(0.8)).frame(height: 2) }
-                .ignoresSafeArea()
+            CyBackground()
 
             GeometryReader { geo in
                 if geo.size.height > geo.size.width {

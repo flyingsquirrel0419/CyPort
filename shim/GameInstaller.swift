@@ -4,7 +4,8 @@
 // tools/ios_retarget.py --game-folder does on a Mac) and writes a new IPA: this app + Games/<version>/.
 // iOS only runs code that is signed into an installed app, so that IPA is then installed over this app with SideStore,
 // LiveContainer, AltStore or TrollStore (they sign it). Same bundle ID: Documents (game data, saves) and sign-ins stay.
-// No UIKit here (InstallerUI.swift has the screen).
+// Or, CyPort's original way: the Mac game program the user already has (Cyberpunk2077.app, picked in Files) instead
+// of the Steam download - the same conversion. No UIKit here (InstallerUI.swift has the screen).
 import Foundation
 import zlib
 
@@ -52,10 +53,47 @@ final class GameInstaller: @unchecked Sendable {
     // MARK: 3. Games/<version>/ + 4. the IPA
 
     func build(_ p: Prepared, progress: @escaping (String) -> Void) throws -> Result {
-        let fm = FileManager.default
         let app = downloadDir.appendingPathComponent(p.plan.files.first.map { String($0.path.prefix(GameFiles.appBundle.count)) } ?? "Cyberpunk2077.app")
+        return try build(app: app, redscriptsSize: p.redscriptsSize, tweakdbSize: p.tweakdbSize, source: p.buildName, progress: progress)
+    }
+
+    // MARK: or: your own copy (CyPort's original way - the Mac game you already have, picked in Files)
+
+    struct Local { let app: URL; let short: String; let redscriptsSize: Int64; let tweakdbSize: Int64; let hasData: Bool }
+    /// the picked folder: Cyberpunk2077.app itself, the game folder that holds it (Steam/GOG layout), or a folder above that
+    static func findLocal(_ picked: URL) throws -> Local {
+        let fm = FileManager.default
+        func isApp(_ u: URL) -> Bool { fm.fileExists(atPath: u.appendingPathComponent("Contents/MacOS/Cyberpunk2077").path) }
+        func child(_ dir: URL) -> URL? {
+            ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []).first { $0.lastPathComponent.lowercased() == GameFiles.appBundle && isApp($0) }
+        }
+        var app: URL?
+        if isApp(picked) { app = picked }
+        else if let c = child(picked) { app = c }
+        else {
+            for d in (try? fm.contentsOfDirectory(at: picked, includingPropertiesForKeys: nil)) ?? [] { if let c = child(d) { app = c; break } }
+        }
+        guard let app else {
+            if fm.fileExists(atPath: picked.appendingPathComponent("archive/pc").path) || fm.fileExists(atPath: picked.appendingPathComponent("bin/x64").path) {
+                throw StoreError("That's the Windows version of the game. CyPort needs the Mac version (Cyberpunk2077.app), which comes with your Steam or GOG purchase - or use Steam above.")
+            }
+            throw StoreError("No Cyberpunk2077.app in \(picked.lastPathComponent). Pick Cyberpunk2077.app or the game folder that holds it.")
+        }
+        let root = app.deletingLastPathComponent()
+        func size(_ rel: String) -> Int64 { ((try? fm.attributesOfItem(atPath: root.appendingPathComponent(rel).path))?[.size] as? NSNumber)?.int64Value ?? 0 }
+        let info = (try? Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")))
+            .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] } ?? [:]
+        let rs = size("r6/cache/final.redscripts")
+        return Local(app: app, short: info["CFBundleShortVersionString"] as? String ?? "?", redscriptsSize: rs, tweakdbSize: size("r6/cache/tweakdb.bin"), hasData: rs > 0)
+    }
+    func build(_ l: Local, progress: @escaping (String) -> Void) throws -> Result {
+        try build(app: l.app, redscriptsSize: l.redscriptsSize, tweakdbSize: l.tweakdbSize, source: "your own copy", progress: progress)
+    }
+
+    func build(app: URL, redscriptsSize: Int64, tweakdbSize: Int64, source: String, progress: @escaping (String) -> Void) throws -> Result {
+        let fm = FileManager.default
         let exe = app.appendingPathComponent("Contents/MacOS/Cyberpunk2077")
-        guard fm.fileExists(atPath: exe.path) else { throw StoreError("The download has no Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077.") }
+        guard fm.fileExists(atPath: exe.path) else { throw StoreError("No Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077 there.") }
         let info = (try? Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")))
             .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] } ?? [:]
         let short = info["CFBundleShortVersionString"] as? String ?? "?"
@@ -80,9 +118,9 @@ final class GameInstaller: @unchecked Sendable {
         }
         for l in log { storeLog("retarget: \(l)") }
         let plist: [String: Any] = ["version": version, "number": number, "CyPortGameExe": md5, "shortVersion": short, "bundleVersion": bundleVersion,
-                                    "redscriptsSize": p.redscriptsSize, "tweakdbSize": p.tweakdbSize, "source": p.buildName]
+                                    "redscriptsSize": redscriptsSize, "tweakdbSize": tweakdbSize, "source": source]
         try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: g.appendingPathComponent("game.plist"))
-        storeLog("installer: Games/\(version): \(short) (\(p.buildName)), md5 \(md5)")
+        storeLog("installer: Games/\(version): \(short) (\(source)), md5 \(md5)")
 
         progress("Writing the app with the game (IPA)…")
         let ipa = outDir.appendingPathComponent("CyPort-\(version).ipa")

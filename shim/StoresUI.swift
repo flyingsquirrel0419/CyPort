@@ -172,13 +172,13 @@ struct StoreView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            CyBackground()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack {
-                        Text(model.updateRoot != nil ? "Update Cyberpunk" : "Get the game from your store").font(.title2.bold()).foregroundColor(.white)
+                        CyTitle(subtitle: model.updateRoot != nil ? "Update Cyberpunk" : "Get the game data", size: 40)
                         Spacer()
-                        if case .downloading = model.phase {} else { Button("Close") { model.cancel(); dismiss() }.foregroundColor(.yellow) }
+                        if case .downloading = model.phase {} else { Button("Close") { model.cancel(); dismiss() }.buttonStyle(CySecondaryButtonStyle()) }
                     }
                     Text(model.updateRoot != nil
                          ? "This CyPort plays Cyberpunk \(GameData.appVersionName). Sign in to GOG or Steam (where you bought it): CyPort checks your game files and downloads only the ones that are missing or from another version. Steam or PC copies work too: the Mac version comes with your purchase."
@@ -190,6 +190,7 @@ struct StoreView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .tint(cyberYellow)
         .sheet(item: $login) { s in
             LoginSheet(store: s) { login = nil; model.refresh += 1 }
         }
@@ -208,9 +209,9 @@ struct StoreView: View {
         case .ready: readyView
         case .downloading: downloadingView
         case .done(let m):
-            Text("Done").font(.title.bold()).foregroundColor(.green)
+            CyHeading(text: "Done", icon: "checkmark.seal")
             Text(m).foregroundColor(.white)
-            Button("Close the app") { exit(0) }.buttonStyle(.borderedProminent).tint(.yellow).foregroundColor(.black)
+            Button("Close the app") { exit(0) }.buttonStyle(CyPrimaryButtonStyle())
         }
     }
 
@@ -227,7 +228,7 @@ struct StoreView: View {
                     Text("This CyPort plays every version listed here. Pick the one you want: CyPort brings your game files to it (only the files that differ) and starts that version from then on.")
                         .font(.caption).foregroundColor(.gray)
                 }
-                .padding(14).background(Color.white.opacity(0.07)).cornerRadius(12)
+                .cyCard()
             }
             ForEach(StoreKind.allCases) { s in
                 HStack {
@@ -238,12 +239,12 @@ struct StoreView: View {
                     Spacer()
                     if s.signedIn {
                         Button("Sign out") { s.signOut(); model.refresh += 1 }.font(.caption).foregroundColor(.gray)
-                        Button(model.updateRoot != nil ? "Update" : "Download") { model.prepare(s) }.buttonStyle(.borderedProminent).tint(.yellow).foregroundColor(.black)
+                        Button(model.updateRoot != nil ? "Update" : "Download") { model.prepare(s) }.buttonStyle(CyPrimaryButtonStyle())
                     } else {
-                        Button("Sign in") { login = s }.buttonStyle(.bordered).tint(.yellow)
+                        Button("Sign in") { login = s }.buttonStyle(CySecondaryButtonStyle())
                     }
                 }
-                .padding(14).background(Color.white.opacity(0.07)).cornerRadius(12)
+                .cyCard()
             }
         }
     }
@@ -256,7 +257,7 @@ struct StoreView: View {
                     Picker("Version", selection: Binding(get: { model.gogBuild?.id ?? "" }, set: { id in
                         model.gogBuild = model.gogBuilds.first { $0.id == id }; model.prepare(.gog) })) {
                         ForEach(model.gogBuilds, id: \.id) { b in Text("\(b.version) (\(b.date))").tag(b.id) }
-                    }.pickerStyle(.menu).tint(.yellow)
+                    }.pickerStyle(.menu).tint(cyberYellow)
                 }
                 Text(model.updateRoot != nil ? "Update to \(GameData.appVersionName): \(p.files.count) file\(p.files.count == 1 ? "" : "s") to download · \(gb(p.totalBytes))"
                                              : "Version: \(p.versionName) · \(p.files.count) files · \(gb(p.totalBytes))")
@@ -282,7 +283,7 @@ struct StoreView: View {
                         if case .folder(let u) = model.destination { Label(u.lastPathComponent, systemImage: "largecircle.fill.circle") }
                         else { Label("A folder (SSD)…", systemImage: "circle") }
                     }
-                }.tint(.yellow)
+                }.tint(cyberYellow)
                 }
                 Text("\(model.resuming ? "Continues the earlier download · " : "")Needs \(gb(model.needBytes)) · \(gb(model.freeBytes)) free")
                     .font(.caption).foregroundColor(model.needBytes > model.freeBytes ? .orange : .gray)
@@ -292,7 +293,7 @@ struct StoreView: View {
                     Button("Back") { model.phase = .choose }
                     Spacer()
                     Button(model.resuming ? "Continue" : model.updateRoot != nil ? "Update" : "Download") { model.start() }
-                        .buttonStyle(.borderedProminent).tint(.yellow).foregroundColor(.black)
+                        .buttonStyle(CyPrimaryButtonStyle())
                         .disabled(model.needBytes > model.freeBytes)
                 }
             }
@@ -302,10 +303,10 @@ struct StoreView: View {
     @ViewBuilder func versionNote(_ s: StoreKind, _ p: DLPlan) -> some View {
         let digits = Game.versionDigits(p.versionName)
         if s == .steam {
-            Text("Steam always has its newest version. If it's newer than \(Game.appVersion), the game may not start: then rebuild CyPort from an up-to-date Mac copy.")
+            Text("Steam always has its newest version. If it's newer than \(Game.appVersion), the game may not start: then get the CyPort for that version.")
                 .font(.caption).foregroundColor(.orange)
         } else if digits != Game.versionDigits(Game.appVersion) {
-            Text("This is not the same version as your app (\(Game.appVersion)). The game data and the game program must match: pick the matching version, or rebuild CyPort from the same version.")
+            Text("This is not the same version as your app (\(Game.appVersion)). The game data and the game program must match: pick the matching version, or set up CyPort with the same version.")
                 .font(.caption).foregroundColor(.orange)
         }
     }
@@ -314,13 +315,13 @@ struct StoreView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Downloading from \(model.store?.rawValue ?? "")…").font(.headline).foregroundColor(.white)
             let pr = model.progress
-            ProgressView(value: Double(pr?.done ?? 0), total: Double(max(pr?.total ?? 1, 1))).tint(.yellow)
+            CyProgress(done: pr?.done ?? 0, total: pr?.total ?? 1)
             if let pr {
                 Text("\(gb(pr.done, 2)) of \(gb(pr.total)) · \(String(format: "%.1f", pr.bytesPerSecond / 1e6)) MB/s · \(timeLeft(pr.secondsLeft))")
                     .font(.caption.monospacedDigit()).foregroundColor(.white)
                 Text(pr.file).font(.caption2).foregroundColor(.gray).lineLimit(1)
             } else { Text("Starting…").font(.caption).foregroundColor(.gray) }
-            Button("Pause") { model.cancel() }.foregroundColor(.yellow)
+            Button("Pause") { model.cancel() }.buttonStyle(CySecondaryButtonStyle())
         }
     }
     func gb(_ b: Int64, _ decimals: Int = 1) -> String { String(format: "%.\(decimals)f GB", Double(b) / 1e9) }
