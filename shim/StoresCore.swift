@@ -413,6 +413,7 @@ final class Downloader: @unchecked Sendable {
         var current: FileHandle?, currentFile = -1, fileWritten: Int64 = 0
         defer { try? current?.close() }
         var qi = 0
+        var waited = 0.0, statFrom = CFAbsoluteTimeGetCurrent(), statDone = done      // for the log: network or disk?
         // files that already finished (or are empty) still need to exist
         for s in starts where plan.files[s.file].parts.isEmpty || s.part == plan.files[s.file].parts.count {
             let u = dest.appendingPathComponent(plan.files[s.file].path)
@@ -438,7 +439,9 @@ final class Downloader: @unchecked Sendable {
             else {
                 let t = inflight[part.chunk] ?? Task { try await fetch(part.chunk) }
                 inflight[part.chunk] = nil
+                let w0 = CFAbsoluteTimeGetCurrent()
                 data = try await t.value
+                waited += CFAbsoluteTimeGetCurrent() - w0
             }
             uses[part.chunk] -= 1
             if uses[part.chunk] > 0 { cache[part.chunk] = data } else { cache[part.chunk] = nil }
@@ -454,6 +457,12 @@ final class Downloader: @unchecked Sendable {
             qi += 1
             let now = Date()
             if now.timeIntervalSince(lastSave) > 5 { try current?.synchronize(); saveJournal(); lastSave = now }
+            let tn = CFAbsoluteTimeGetCurrent()
+            if tn - statFrom > 20 {
+                storeLog(String(format: "download: %.2f MB/s written, %.0f%% of the time waiting for the network, %d requests running, %.0f MB ahead",
+                                Double(done - statDone) / (tn - statFrom) / 1e6, waited / (tn - statFrom) * 100, inflight.count, Double(aheadBytes) / 1e6))
+                statFrom = tn; statDone = done; waited = 0
+            }
             // keep the decoded-chunk cache bounded (Epic chunks can be shared between far-apart files)
             if cache.count > 256 { for k in cache.keys.prefix(cache.count - 192) { cache[k] = nil } }
         }
@@ -909,6 +918,8 @@ final class SteamStore: @unchecked Sendable {
             let m = try PBMessage(x)
             let type = m.s(1) ?? "", https = m.s(12) ?? ""
             guard type == "SteamCache" || type == "CDN", https != "unavailable", let v = m.s(9) ?? m.s(8) else { continue }
+            // proxies need their own request path, China-only servers don't serve other regions well
+            if (m.u(10) ?? 0) != 0 || (m.u(7) ?? 0) != 0 { continue }
             if let allowed = m.fields[13], !allowed.isEmpty {
                 let ids = allowed.compactMap { if case .varint(let v) = $0 { return v }; return nil }
                 if !ids.isEmpty && !ids.contains(UInt64(Game.steamApp)) { continue }
@@ -917,6 +928,7 @@ final class SteamStore: @unchecked Sendable {
         }
         out.sort { ($0.1, $0.2) < ($1.1, $1.2) }
         guard !out.isEmpty else { throw StoreError("Steam gave no download server") }
+        storeLog("steam: cell \(await cm.cellID), servers: " + out.prefix(10).map { "\($0.0.host) (load \($0.2))" }.joined(separator: ", "))
         return out.map(\.0)
     }
 
@@ -968,22 +980,21 @@ final class SteamStore: @unchecked Sendable {
         let picked = try GameFiles.pick(files, scope: scope)
         let pickedLinks = GameFiles.pickLinks(links, files: files, scope: scope)
         let refs = chunks, ks = keys, hosts = servers.map(\.host)
-        // the best few servers (Steam sorts them: closest / least loaded first) share the chunks; the rest only on retries.
-        // Spreading over all of them (up to 20, some far away) made the slowest ones hold the download up.
-        let best = Array(hosts.prefix(4))
-        let counter = Counter()
+        let pool = HostPool(hosts)
         return DLPlan(files: picked, chunkCount: refs.count, version: scope == .data ? "steam-\(build)" : "steam-\(build)-\(scope)", versionName: "Steam build \(build)", fetch: { i in
             let c = refs[i]; var last: Error = StoreError("chunk")
             for attempt in 0..<6 {
-                let n = counter.next()
-                let host = attempt < 2 ? best[(n + attempt) % best.count] : hosts[(n + attempt) % hosts.count]
+                let host = pool.take()
+                let t0 = CFAbsoluteTimeGetCurrent()
                 do {
                     let enc = try await Net.request(URL(string: "https://\(host)/depot/\(c.depot)/chunk/\(c.sha.hex)")!, tries: 1)
+                    pool.done(host, bytes: enc.count, seconds: CFAbsoluteTimeGetCurrent() - t0)
                     let plain = try Self.decodeChunk(enc, key: ks[c.depot]!, size: c.size)
                     guard Hash.steamAdler(plain) == c.crc else { throw StoreError("chunk checksum mismatch") }
                     return plain
-                } catch is CancellationError { throw CancellationError() } catch { last = error }
-                try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                } catch is CancellationError { pool.release(host); throw CancellationError() }
+                catch { pool.failed(host, error); last = error }
+                if attempt > 0 { try await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000) }
             }
             throw last
         }, links: pickedLinks)
@@ -1053,6 +1064,55 @@ final class SteamStore: @unchecked Sendable {
         }
         if h == [0x50, 0x4B, 0x03, 0x04] { return try Zip.firstEntry(Data(b)) }
         throw StoreError("unknown chunk format")
+    }
+}
+
+/// Steam download servers: each chunk goes to the healthy server with the fewest requests still running (a slow
+/// server keeps its requests longer, so it gets fewer new ones - the fast ones end up doing most of the work).
+/// A server that fails twice in a row sits out 30 s. Logs what each server did every 20 s (macshim.log).
+final class HostPool: @unchecked Sendable {
+    private struct H { let name: String; var running = 0, fails = 0, ok = 0, bytes = 0, seconds = 0.0, errors = 0; var outUntil = 0.0; var lastError = "" }
+    private var hs: [H]
+    private let l = NSLock()
+    private var lastLog = CFAbsoluteTimeGetCurrent()
+    init(_ hosts: [String]) { hs = hosts.prefix(12).map { H(name: $0) } }
+    func take() -> String {
+        l.lock(); defer { l.unlock() }
+        let now = CFAbsoluteTimeGetCurrent()
+        var best = -1
+        for i in hs.indices where hs[i].outUntil <= now {
+            // fewer running wins; on a tie the server Steam ranked higher (earlier) wins
+            if best < 0 || hs[i].running < hs[best].running { best = i }
+        }
+        if best < 0 { best = hs.indices.min { hs[$0].outUntil < hs[$1].outUntil }! }
+        hs[best].running += 1
+        return hs[best].name
+    }
+    private func index(_ h: String) -> Int? { hs.firstIndex { $0.name == h } }
+    func release(_ h: String) { l.lock(); if let i = index(h) { hs[i].running -= 1 }; l.unlock() }
+    func done(_ h: String, bytes: Int, seconds: Double) {
+        l.lock()
+        if let i = index(h) { hs[i].running -= 1; hs[i].fails = 0; hs[i].ok += 1; hs[i].bytes += bytes; hs[i].seconds += seconds }
+        let now = CFAbsoluteTimeGetCurrent(), report = now - lastLog > 20
+        if report { lastLog = now }
+        let lines = report ? hs.filter { $0.ok + $0.errors > 0 }.map {
+            String(format: "%@ %d ok %.0f MB, %.0f ms/chunk, %.2f MB/s per request, %d errors%@", $0.name, $0.ok, Double($0.bytes) / 1e6,
+                   $0.ok > 0 ? $0.seconds / Double($0.ok) * 1000 : 0, $0.seconds > 0 ? Double($0.bytes) / $0.seconds / 1e6 : 0,
+                   $0.errors, $0.lastError.isEmpty ? "" : " (last: \($0.lastError))")
+        } : []
+        l.unlock()
+        if report { storeLog("download servers: " + lines.joined(separator: " | ")) }
+    }
+    func failed(_ h: String, _ e: Error) {
+        l.lock()
+        var first = false
+        if let i = index(h) {
+            hs[i].running -= 1; hs[i].fails += 1; hs[i].errors += 1; first = hs[i].errors <= 3
+            hs[i].lastError = e.localizedDescription
+            if hs[i].fails >= 2 { hs[i].outUntil = CFAbsoluteTimeGetCurrent() + 30; hs[i].fails = 0 }
+        }
+        l.unlock()
+        if first { storeLog("download server \(h): \(e.localizedDescription)") }
     }
 }
 
