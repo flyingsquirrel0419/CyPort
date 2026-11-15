@@ -26,7 +26,54 @@ final class GameInstaller: @unchecked Sendable {
         let buildName: String            /// "Steam build 12345678"
         let redscriptsSize: Int64, tweakdbSize: Int64
     }
-    struct Result { let ipa: URL; let version: String; let size: Int64; let log: [String] }
+    /// ipa nil: the game program went straight into this app (LiveContainer), no reinstall
+    struct Result { let ipa: URL?; let version: String; let size: Int64; let log: [String] }
+
+    // MARK: LiveContainer: one app, no IPA
+    // Inside LiveContainer this app's bundle lies in LiveContainer's own Documents, so it can be written. LiveContainer
+    // checks the main executable's signature before every launch and, if it isn't valid, signs every Mach-O in the
+    // bundle with its certificate (LCAppInfo patchExecAndSignIfNeed + ZSigner signWithAppPath). So: Games/<version>/
+    // goes into the bundle, the starter's signature is made invalid on purpose, and the next launch from LiveContainer
+    // signs the new game files too.
+    static var inLiveContainer: Bool {
+        NSClassFromString("LCSharedUtils") != nil && FileManager.default.isWritableFile(atPath: Bundle.main.bundlePath)
+    }
+    func installHere(_ games: URL) throws {
+        let fm = FileManager.default
+        let dest = Bundle.main.bundleURL.appendingPathComponent("Games", isDirectory: true)
+        try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        for v in try fm.contentsOfDirectory(atPath: games.path) {
+            let to = dest.appendingPathComponent(v)
+            if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
+            try fm.moveItem(at: games.appendingPathComponent(v), to: to)
+        }
+        try Self.askLiveContainerToSign()
+        storeLog("installer: game program put into this app (LiveContainer signs it on the next launch)")
+    }
+    /// flips a byte of the starter's first page hash (its code stays the same): LiveContainer then re-signs the app.
+    /// Written as a new file and renamed over the running one (writing a running executable in place gets it killed).
+    static func askLiveContainerToSign() throws {
+        guard let exe = Bundle.main.executableURL else { throw StoreError("this app has no executable?") }
+        var d = [UInt8](try Data(contentsOf: exe))
+        guard d.count > 32, MachOSign.le32(d, 0) == 0xfeedfacf else { throw StoreError("the app's starter isn't a thin 64-bit Mach-O") }
+        var off = 32, sig = -1
+        for _ in 0..<Int(MachOSign.le32(d, 16)) {
+            if MachOSign.le32(d, off) == MachOSign.LC_CODE_SIGNATURE { sig = Int(MachOSign.le32(d, off + 8)) }
+            off += Int(MachOSign.le32(d, off + 4))
+        }
+        func be(_ o: Int) -> Int { Int(d[o]) << 24 | Int(d[o + 1]) << 16 | Int(d[o + 2]) << 8 | Int(d[o + 3]) }
+        guard sig > 0, sig + 12 <= d.count, be(sig) == 0xfade0cc0 else { throw StoreError("the app's starter has no signature") }
+        var cd = -1
+        for i in 0..<be(sig + 8) where be(sig + 12 + 8 * i) == 0 { cd = sig + be(sig + 16 + 8 * i) }
+        guard cd > 0, be(cd) == 0xfade0c02 else { throw StoreError("the app's starter has no CodeDirectory") }
+        let at = cd + be(cd + 16)                      // hashOffset: the first page's hash
+        guard at < d.count else { throw StoreError("the app's starter signature is cut short") }
+        d[at] ^= 0xff
+        let tmp = exe.deletingLastPathComponent().appendingPathComponent(".\(exe.lastPathComponent).new")
+        try Data(d).write(to: tmp)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmp.path)
+        _ = try FileManager.default.replaceItemAt(exe, withItemAt: tmp)
+    }
 
     // MARK: 1. what to download
 
@@ -126,6 +173,12 @@ final class GameInstaller: @unchecked Sendable {
         try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: g.appendingPathComponent("game.plist"))
         storeLog("installer: Games/\(version): \(short) (\(source)), md5 \(md5)")
 
+        if Self.inLiveContainer {
+            progress("Putting the game program into CyPort…")
+            try installHere(games)
+            try? fm.removeItem(at: work)
+            return Result(ipa: nil, version: version, size: 0, log: log)
+        }
         progress("Writing the app with the game (IPA)…")
         let ipa = outDir.appendingPathComponent("CyPort-\(version).ipa")
         try writeIPA(to: ipa, games: games, short: short, bundleVersion: bundleVersion)

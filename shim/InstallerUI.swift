@@ -44,7 +44,9 @@ final class InstallerModel: ObservableObject {
     init(_ i: GameInstaller) {
         installer = i
         if let e = ProcessInfo.processInfo.environment["CYPORT_LOAD_ERROR"] {
-            loadError = e.contains("code signature") ? "The game program in this app isn't signed correctly (an app made by an older CyPort). Make it again: it takes a minute." : "The game program in this app didn't load. Make it again."
+            loadError = e.contains("code signature") ? "The game program in this app isn't signed correctly (made by an older CyPort). Make it again: it takes a minute." : "The game program in this app didn't load. Make it again."
+            // the broken Games/ in this app (LiveContainer: writable) would be picked again on the next start
+            if GameInstaller.inLiveContainer { try? FileManager.default.removeItem(at: Bundle.main.bundleURL.appendingPathComponent("Games")) }
             // the app made from it is the broken one: don't offer it again
             for f in (try? FileManager.default.contentsOfDirectory(at: i.outDir, includingPropertiesForKeys: nil)) ?? []
                 where f.lastPathComponent.hasPrefix("CyPort-") && f.pathExtension == "ipa" { try? FileManager.default.removeItem(at: f) }
@@ -144,8 +146,8 @@ final class InstallerModel: ObservableObject {
     }
     func cancel() { task?.cancel() }
     func startOver() {
-        if case .done(let r) = phase { try? FileManager.default.removeItem(at: r.ipa) }
-        if case .data(let r) = phase { try? FileManager.default.removeItem(at: r.ipa) }
+        if case .done(let r) = phase, let ipa = r.ipa { try? FileManager.default.removeItem(at: ipa) }
+        if case .data(let r) = phase, let ipa = r.ipa { try? FileManager.default.removeItem(at: ipa) }
         phase = .start
     }
 }
@@ -335,7 +337,7 @@ struct InstallerView: View {
                 dataStore = m
             } label: { Label("Download the game data", systemImage: "arrow.down.circle") }
                 .buttonStyle(CyPrimaryButtonStyle(fill: true))
-            Button("Later – install the app first") { model.phase = .done(r) }
+            Button(r.ipa == nil ? "Later" : "Later – install the app first") { model.phase = .done(r) }
                 .buttonStyle(CySecondaryButtonStyle(fill: true))
             Text("Already have the game data in Files or on a drive? Choose Later: after installing, CyPort's first screen imports it or plays from that folder.").cyNote()
         }
@@ -343,13 +345,31 @@ struct InstallerView: View {
 
     // MARK: step 3: install
 
-    func done(_ r: GameInstaller.Result) -> some View {
+    @ViewBuilder func done(_ r: GameInstaller.Result) -> some View {
+        if let ipa = r.ipa { install(r, ipa) } else { restart(r) }
+    }
+    /// LiveContainer: the game program is already in this app
+    func restart(_ r: GameInstaller.Result) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                CyHeading(text: "Last step: start again", icon: "arrow.clockwise")
+                Text("The game program is in CyPort now – no second app. Close CyPort and start it again from LiveContainer: LiveContainer signs the new game files first (a few seconds).")
+                    .font(.subheadline).foregroundStyle(.white.opacity(0.8)).fixedSize(horizontal: false, vertical: true)
+                row("Cyberpunk", r.version)
+                row("Game data", InstallerModel.hasData ? "ready ✓" : "next, on CyPort's first screen")
+            }.cyCard()
+            Text("If it then says 'code signature invalid': in LiveContainer open CyPort's settings → Force Sign, then start it again.").cyNote()
+            Button { exit(0) } label: { Label("Close CyPort", systemImage: "xmark.circle") }
+                .buttonStyle(CyPrimaryButtonStyle(fill: true))
+        }
+    }
+    func install(_ r: GameInstaller.Result, _ ipa: URL) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 12) {
                 CyHeading(text: "Last step: install", icon: "square.and.arrow.down")
                 Text("iOS only runs game code that is inside an installed app. CyPort has put the game program into a new copy of itself – install it over this one.")
                     .font(.subheadline).foregroundStyle(.white.opacity(0.8)).fixedSize(horizontal: false, vertical: true)
-                row("App", r.ipa.lastPathComponent)
+                row("App", ipa.lastPathComponent)
                 row("Size", gb(r.size, 2))
                 row("Game data", InstallerModel.hasData ? "ready ✓" : "after installing")
             }.cyCard()
@@ -360,7 +380,7 @@ struct InstallerView: View {
                 Text("The app file is also in Files → On My iPhone → CyPort; delete it after installing.").cyNote()
                 Text("Free Apple ID: the app needs the Increased Memory Limit – see GetMoreRam in the README.").cyNote()
             }
-            Button { share = SharedFile(url: r.ipa) } label: { Label("Install…", systemImage: "square.and.arrow.up") }
+            Button { share = SharedFile(url: ipa) } label: { Label("Install…", systemImage: "square.and.arrow.up") }
                 .buttonStyle(CyPrimaryButtonStyle(fill: true))
             Button("Start over", role: .destructive) { model.startOver() }.font(.caption).foregroundStyle(cyberRed)
         }
@@ -371,7 +391,7 @@ struct InstallerView: View {
     /// 1 GAME PROGRAM · 2 GAME DATA · 3 INSTALL
     var steps: some View {
         HStack(spacing: 6) {
-            ForEach(Array(["Program", "Data", "Install"].enumerated()), id: \.offset) { i, t in
+            ForEach(Array(["Program", "Data", GameInstaller.inLiveContainer ? "Restart" : "Install"].enumerated()), id: \.offset) { i, t in
                 let n = i + 1, cur = model.step
                 HStack(spacing: 6) {
                     Text(n < cur ? "✓" : "\(n)").font(.system(size: 12, weight: .heavy, design: .monospaced))
