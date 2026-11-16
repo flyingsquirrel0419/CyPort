@@ -6095,6 +6095,140 @@ static void MSSaveAudit2(const struct mach_header *mh, intptr_t slide) {
 }
 __attribute__((constructor)) static void MSInstallSaveAudit2(void) { _dyld_register_func_for_add_image(MSSaveAudit2); }
 
+/* ---------------------------------------------------------------- save audit, part 3 (diagnostic)
+   Part 2 showed the Steam build lists every slot's files and then touches none of them, with no stat, open, lstat or
+   readdir call failing. What's left: the game asking libGameServicesSteam (found with dlsym) whether saves may be
+   listed, libc++'s own file calls (std::ifstream, std::filesystem) and Foundation's. Each is logged here. */
+static const void *g_gameMH;
+static BOOL MSFromGame(void *ret) { Dl_info d; return g_gameMH && dladdr(ret, &d) && d.dli_fbase == g_gameMH; }
+static int MSWrapSlot(const struct mach_header *mh, void *real, void *wrap) {
+    int hits = 0; if (!real) return 0;
+    const char *segs[][2] = { { "__DATA_CONST", "__got" }, { "__DATA", "__got" }, { "__DATA", "__la_symbol_ptr" }, { "__AUTH_CONST", "__auth_got" } };
+    for (size_t g = 0; g < sizeof segs / sizeof *segs; g++) {
+        unsigned long sz = 0; uint8_t *sec = getsectiondata((const struct mach_header_64 *)mh, segs[g][0], segs[g][1], &sz);
+        for (unsigned long o = 0; sec && o + 8 <= sz; o += 8) {
+            void **slot = (void **)(sec + o); if (*slot != real) continue;
+            vm_address_t pg = (vm_address_t)slot & ~(vm_address_t)0x3fff;
+            vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            *slot = wrap; hits++;
+            vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ);
+        }
+    }
+    return hits;
+}
+/* the text of a libc++ std::string / std::filesystem::path (either string layout; NULL if it doesn't look like a path) */
+static const char *MSStdStr(const void *s) {
+    const uint8_t *b = s; const char *p;
+    if ((b[0] & 1) && (p = *(const char *const *)(b + 16)) && malloc_size(p) && p[0] == '/') return p;
+    if (!(b[0] & 1) && b[1] == '/') return (const char *)b + 1;
+    if (b[0] == '/') return (const char *)b;
+    if ((b[23] & 0x80) && (p = *(const char *const *)b) && malloc_size(p) && p[0] == '/') return p;
+    return NULL;
+}
+/* GameServices calls the game looks up: logged with their arguments and result (first 12 calls of each) */
+typedef uint64_t (*MSGSFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static const char *g_gsNames[] = { "CheckAdditionalContentStatus", "CloudSaveReady", "DeleteCloudSavedGameData", "FetchCloudSavedGameData",
+    "GetLanguageCodeName", "GetLibraryVersion", "GetPlatformName", "Initialize", "IsInstallThroughAppEnabled", "IsPurchaseThroughAppEnabled",
+    "OpenWebBrowser", "RequestAdditionalContentInstall", "RequestAdditionalContentPurchase", "RequestEncryptedAppTicket", "RequestPlatformToken",
+    "SaveDataToCloud", "SetAddtionalContentInstallCallback", "SetCommandLineHandler", "SetLogger", "SetNetworkState", "SetOverlayHandler",
+    "SetRichPresence", "SignIn", "SyncAchievement", "SyncAchievementList", "Uninitialize", "UnlockAchievement", "VerifyDataIntegrity" };
+#define MS_NGS (sizeof g_gsNames / sizeof *g_gsNames)
+static MSGSFn g_gsReal[MS_NGS]; static _Atomic int g_gsCalls[MS_NGS];
+static uint64_t MSGSCall(int i, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
+    uint64_t r = g_gsReal[i](a, b, c, d, e, f, g, h);
+    int n = g_gsCalls[i]++;
+    if (n < 12) {
+        BOOL str = !strcmp(g_gsNames[i], "GetPlatformName") || !strcmp(g_gsNames[i], "GetLanguageCodeName") || !strcmp(g_gsNames[i], "GetLibraryVersion");
+        MSLogf(@"steam services: game calls %s(%#llx, %#llx, %#llx, %#llx) -> %#llx%s%s%s (call %d)", g_gsNames[i], a, b, c, d, r,
+               str && r > 0x100000000ULL ? " \"" : "", str && r > 0x100000000ULL ? (const char *)r : "", str && r > 0x100000000ULL ? "\"" : "", n + 1);
+    }
+    return r;
+}
+#define GSW(i) static uint64_t gsw##i(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h) { return MSGSCall(i, a, b, c, d, e, f, g, h); }
+GSW(0) GSW(1) GSW(2) GSW(3) GSW(4) GSW(5) GSW(6) GSW(7) GSW(8) GSW(9) GSW(10) GSW(11) GSW(12) GSW(13) GSW(14) GSW(15) GSW(16) GSW(17)
+GSW(18) GSW(19) GSW(20) GSW(21) GSW(22) GSW(23) GSW(24) GSW(25) GSW(26) GSW(27)
+static void *g_gsWrap[] = { gsw0, gsw1, gsw2, gsw3, gsw4, gsw5, gsw6, gsw7, gsw8, gsw9, gsw10, gsw11, gsw12, gsw13, gsw14, gsw15, gsw16, gsw17,
+    gsw18, gsw19, gsw20, gsw21, gsw22, gsw23, gsw24, gsw25, gsw26, gsw27 };
+_Static_assert(sizeof g_gsWrap / sizeof *g_gsWrap == MS_NGS, "one wrapper per GameServices function");
+static void *g_rDlsym;
+static void *w_dlsym(void *h, const char *name) {
+    void *r = ((void *(*)(void *, const char *))g_rDlsym)(h, name);
+    Dl_info d; BOOL gs = r && dladdr(r, &d) && d.dli_fname && strstr(d.dli_fname, "libGameServices");
+    static _Atomic int n; if (gs || n++ < 60) MSLogf(@"steam services: game looks up %s -> %p%s", name ?: "(null)", r, gs ? " (GameServices)" : "");
+    if (gs) for (size_t i = 0; i < MS_NGS; i++) if (!strcmp(name, g_gsNames[i])) { g_gsReal[i] = (MSGSFn)r; return g_gsWrap[i]; }
+    return r;
+}
+/* libc++: std::basic_filebuf::open (std::ifstream / std::ofstream) and std::filesystem::status */
+static void *g_rFbOpen, *g_rFsStatus;
+static void *w_fbopen(void *self, const char *p, unsigned mode) {
+    void *r = ((void *(*)(void *, const char *, unsigned))g_rFbOpen)(self, p, mode); int e = errno;
+    if (MSSavePath(p)) { char tag[64]; snprintf(tag, sizeof tag, "ifstream/ofstream open (mode %#x)", mode); MSSaveNote(tag, p, NULL, r ? 0 : -1, e); }
+    errno = e; return r;
+}
+static uint64_t w_fsstatus(const void *path, void *ec) {
+    uint64_t r = ((uint64_t (*)(const void *, void *))g_rFsStatus)(path, ec); int e = errno;
+    const char *p = MSStdStr(path);
+    if (MSSavePath(p)) { char tag[64]; snprintf(tag, sizeof tag, "std::filesystem::status (type %d)", (int)(int8_t)(r & 0xff)); MSSaveNote(tag, p, NULL, (int8_t)(r & 0xff) > 0 ? 0 : -1, ENOENT); }
+    errno = e; return r;
+}
+/* Foundation, when the game itself asks */
+static IMP g_rFMExists, g_rFMExistsDir, g_rFMAttrs, g_rFMList, g_rFMContents, g_rDataFile, g_rDataFileOpt;
+static BOOL w_fmExists(id s, SEL c, NSString *p) {
+    BOOL r = ((BOOL (*)(id, SEL, NSString *))g_rFMExists)(s, c, p);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager fileExists", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static BOOL w_fmExistsDir(id s, SEL c, NSString *p, BOOL *dir) {
+    BOOL r = ((BOOL (*)(id, SEL, NSString *, BOOL *))g_rFMExistsDir)(s, c, p, dir);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager fileExists:isDirectory", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_fmAttrs(id s, SEL c, NSString *p, NSError **err) {
+    id r = ((id (*)(id, SEL, NSString *, NSError **))g_rFMAttrs)(s, c, p, err);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager attributes", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_fmList(id s, SEL c, NSString *p, NSError **err) {
+    id r = ((id (*)(id, SEL, NSString *, NSError **))g_rFMList)(s, c, p, err);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager list", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_fmContents(id s, SEL c, NSString *p) {
+    id r = ((id (*)(id, SEL, NSString *))g_rFMContents)(s, c, p);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager contentsAtPath", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_dataFile(id s, SEL c, NSString *p) {
+    id r = ((id (*)(id, SEL, NSString *))g_rDataFile)(s, c, p);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSData contentsOfFile", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_dataFileOpt(id s, SEL c, NSString *p, NSUInteger o, NSError **err) {
+    id r = ((id (*)(id, SEL, NSString *, NSUInteger, NSError **))g_rDataFileOpt)(s, c, p, o, err);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSData contentsOfFile:options", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static void MSSwizzle(Class c, SEL s, IMP w, IMP *old) { Method m = class_getInstanceMethod(c, s); if (m) *old = method_setImplementation(m, w); }
+static void MSSaveAudit3(const struct mach_header *mh, intptr_t slide) {
+    Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
+    if ([MSConfig()[@"SaveAudit3"] isEqual:@NO]) return;
+    g_gameMH = mh;
+    g_rDlsym = dlsym(RTLD_DEFAULT, "dlsym");
+    g_rFbOpen = dlsym(RTLD_DEFAULT, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj");
+    g_rFsStatus = dlsym(RTLD_DEFAULT, "_ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE");
+    int a = MSWrapSlot(mh, g_rDlsym, w_dlsym), b = MSWrapSlot(mh, g_rFbOpen, w_fbopen), c = MSWrapSlot(mh, g_rFsStatus, w_fsstatus);
+    Class fm = NSFileManager.class, dc = object_getClass(NSData.class);
+    MSSwizzle(fm, @selector(fileExistsAtPath:), (IMP)w_fmExists, &g_rFMExists);
+    MSSwizzle(fm, @selector(fileExistsAtPath:isDirectory:), (IMP)w_fmExistsDir, &g_rFMExistsDir);
+    MSSwizzle(fm, @selector(attributesOfItemAtPath:error:), (IMP)w_fmAttrs, &g_rFMAttrs);
+    MSSwizzle(fm, @selector(contentsOfDirectoryAtPath:error:), (IMP)w_fmList, &g_rFMList);
+    MSSwizzle(fm, @selector(contentsAtPath:), (IMP)w_fmContents, &g_rFMContents);
+    MSSwizzle(dc, @selector(dataWithContentsOfFile:), (IMP)w_dataFile, &g_rDataFile);
+    MSSwizzle(dc, @selector(dataWithContentsOfFile:options:error:), (IMP)w_dataFileOpt, &g_rDataFileOpt);
+    MSLogf(@"save audit 3: game import slots wrapped: dlsym %d, ifstream open %d, filesystem::status %d; NSFileManager/NSData calls from the game logged", a, b, c);
+}
+__attribute__((constructor)) static void MSInstallSaveAudit3(void) { _dyld_register_func_for_add_image(MSSaveAudit3); }
+
 /* ---------------------------------------------------------------- Bink video (rerouted from libBink2MacArm64) */
 static void *MSBink(const char *sym) {
     static void *h; if (!h) h = dlopen("@rpath/libBink2MacArm64.dylib", RTLD_LAZY | RTLD_NOLOAD); if (!h) h = dlopen("@rpath/libBink2MacArm64.dylib", RTLD_LAZY);
