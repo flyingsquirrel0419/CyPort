@@ -32,7 +32,7 @@ LC_DYLD_CHAINED_FIXUPS = 0x80000034
 # extended-virtual-addressing, so the shim shrinks the big reservations (see "address-space budget" in MacShim.m)
 REROUTE = {"__NSGetExecutablePath", "_sysctlbyname", "_mmap", "_munmap", "_madvise", "_mprotect",
            # case-insensitive retry for game paths (the Mac build assumes a case-insensitive file system)
-           "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open",
+           "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open", "_rename", "_mkdir",
            # retry + log failed or short reads (game data on an external SSD; the engine treats a short read as fatal)
            "_read", "_close", "_lseek",
            # audio graph: logged by the shim (render sizes) and switchable off (NoAudio) while hunting a memory corruption

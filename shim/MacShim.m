@@ -3002,7 +3002,14 @@ int ms_stat(const char *path, struct stat *st) { MS_CASE_RETRY(k_stat(path, st),
 int ms_access(const char *path, int m) __asm("_access");
 int ms_access(const char *path, int m) { MS_CASE_RETRY(k_access(path, m), r != 0, k_access(f, m)) }
 FILE *ms_fopen(const char *path, const char *mode) __asm("_fopen");
-FILE *ms_fopen(const char *path, const char *mode) { MS_CASE_RETRY(k_fopen(path, mode), !r, k_fopen(f, mode)) }
+static FILE *ms_fopen2(const char *path, const char *mode) { MS_CASE_RETRY(k_fopen(path, mode), !r, k_fopen(f, mode)) }
+static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err);
+static BOOL MSSavePath(const char *p);
+FILE *ms_fopen(const char *path, const char *mode) {
+    FILE *r = ms_fopen2(path, mode); int e = errno;
+    if (mode && strpbrk(mode, "wa+") && MSSavePath(path)) MSSaveNote("fopen", path, NULL, r ? 0 : -1, e);
+    errno = e; return r;
+}
 /* ---------------------------------------------------------------- external SSD: survive it dropping off the bus
  * Under load an SSD on the phone's USB-C port can disconnect for a moment (seen: every read on every open file fails
  * with EIO, F_GETPATH fails, and on the next launch the bookmark doesn't resolve until it remounts). The engine treats
@@ -3133,6 +3140,36 @@ static BOOL MSReopenFd(int fd, off_t off) {
     return NO;
 }
 
+/* save audit: every write the game makes where its saves go ("save" in the path) - opened or not (errno), renamed or
+   not - and the free space at the first one, so a save that "didn't happen" shows in macshim.log as either no write at
+   all, a failed one, or one that went somewhere unexpected */
+static BOOL MSSavePath(const char *p) { return p && strcasestr(p, "save") && !strcasestr(p, "saves-backup"); }
+static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err) {
+    static _Atomic int n; if (n++ >= 300) return;
+    static dispatch_once_t once; dispatch_once(&once, ^{
+        NSString *as = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+        NSDictionary *a = [NSFileManager.defaultManager attributesOfFileSystemForPath:as error:nil];
+        NSNumber *imp = [[NSURL fileURLWithPath:as] resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey] error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
+        MSLogf(@"save: free space %.2f GB (%.2f GB counting purgeable), saves folder %@", [a[NSFileSystemFreeSize] doubleValue] / 1e9, imp.doubleValue / 1e9, as);
+    });
+    if (r < 0) MSLogf(@"save: %s FAILED (%s): %s%s%s", what, strerror(err), path, to ? " -> " : "", to ?: "");
+    else MSLogf(@"save: %s ok: %s%s%s", what, path, to ? " -> " : "", to ?: "");
+}
+int ms_rename(const char *from, const char *to) __asm("_rename");
+int ms_rename(const char *from, const char *to) {
+    static int (*real)(const char *, const char *); if (!real) real = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "rename");
+    int r = real(from, to), e = errno;
+    if (MSSavePath(from) || MSSavePath(to)) MSSaveNote("rename", from, to, r, e);
+    errno = e; return r;
+}
+int ms_mkdir(const char *path, mode_t m) __asm("_mkdir");
+int ms_mkdir(const char *path, mode_t m) {
+    static int (*real)(const char *, mode_t); if (!real) real = (int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "mkdir");
+    int r = real(path, m), e = errno;
+    if (MSSavePath(path) && !(r < 0 && e == EEXIST)) MSSaveNote("mkdir", path, NULL, r, e);
+    errno = e; return r;
+}
+
 int ms_open(const char *path, int flags, ...) __asm("_open");
 int ms_open(const char *path, int flags, ...) {
     MSIOSyms();
@@ -3148,6 +3185,7 @@ int ms_open(const char *path, int flags, ...) {
         int e = errno; if (MSWaitForDrive("open")) fd = MSOpenCase(path, flags, mode); else errno = e;
     }
     if (fd >= 0) MSTrackFd(fd, path);
+    if ((flags & (O_WRONLY | O_RDWR | O_CREAT)) && MSSavePath(path)) { int e = errno; MSSaveNote("write", path, NULL, fd, e); errno = e; }
     return fd;
 }
 int ms_close(int fd) __asm("_close");

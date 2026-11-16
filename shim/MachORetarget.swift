@@ -21,7 +21,7 @@ enum MachORetarget {
     static let dylibCmds: Set<UInt32> = [LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD]
     static let reroute: Set<String> = [
         "__NSGetExecutablePath", "_sysctlbyname", "_mmap", "_munmap", "_madvise", "_mprotect",
-        "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open",
+        "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open", "_rename", "_mkdir",
         "_read", "_close", "_lseek", "_AUGraphStart", "_AUGraphSetNodeInputCallback", "_sysconf", "_sysctl", "_dlopen",
         "_BinkOpenWithOptions", "_BinkStartAsyncThread", "_BinkDoFrameAsyncMulti", "_BinkDoFrameAsyncWait",
         "_BinkRegisterFrameBuffers", "_BinkGetFrameBuffersInfo", "_pthread_set_qos_class_self_np",
