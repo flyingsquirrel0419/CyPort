@@ -4523,15 +4523,20 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
             [self msPaint:c]; [self msFeel]; continue;
         }
         if (!_rTouch && [self msNear:p to:_rHome r:80]) { _rTouch = t; _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0; [self msRightStick:p]; continue; }
-        if (p.x < self.bounds.size.width * 0.45) {
-            if (_moveTouch) continue;
+        /* left part of the screen: the move stick - unless the left thumb is already on it, then this finger is the
+           camera (a right thumb landing just left of the middle used to be ignored: "the camera sometimes doesn't move") */
+        if (p.x < self.bounds.size.width * 0.45 && !_moveTouch) {
             _moveTouch = t; _moveOrigin = [self msNear:p to:_lHome r:85] ? _lHome : p;   /* on the stick: centred; elsewhere: it follows the thumb */
             _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
             [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:g_stickR];
             [CATransaction commit];
             [self msLeftStick:p];
-        } else if (!_lookTouch) {
+        } else {
+            /* a new camera finger while one is still held: two thumbs can't both be on the camera, so the old touch is
+               one whose lift UIKit never delivered (a system gesture took it) - it used to block the camera until
+               another touch ended. The newest finger takes over. */
+            if (_lookTouch) { static int n; if (n++ < 5) MSLogf(@"touch pad: camera finger replaced (the previous one's lift never arrived)"); }
             _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0;
             if (MSLookMode() == 2 && g_pad) { _lookC = p; _rBase.opacity = _rKnob.opacity = 1; [self msLookStick:p]; }
         }
@@ -6029,7 +6034,7 @@ static void MSDumpSymbols(const struct mach_header_64 *mh, intptr_t slide, const
     if (exports) out(@"exports", exp);
 }
 static void MSSteamServicesDump(const struct mach_header *mh, intptr_t slide) {
-    if ([MSConfig()[@"SteamSymbolDump"] isEqual:@NO]) return;
+    if (![MSConfig()[@"SteamSymbolDump"] boolValue]) return;          /* diagnostic: only with SteamSymbolDump = YES */
     Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname) return;
     const char *f = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
     if (!strcmp(f, "libGameServicesSteam.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libsteam_api", YES);
@@ -6062,7 +6067,7 @@ static struct dirent *w_readdir(DIR *d) {
 }
 static void MSSaveAudit2(const struct mach_header *mh, intptr_t slide) {
     Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
-    if ([MSConfig()[@"SaveAudit2"] isEqual:@NO]) return;
+    if (![MSConfig()[@"SaveAudit2"] boolValue]) return;          /* diagnostic: only with SaveAudit2 = YES */
     struct { const char *name; void **real; void *wrap; } t[] = {
         { "openat", &g_rOpenat, w_openat }, { "lstat", &g_rLstat, w_lstat }, { "fstatat", &g_rFstatat, w_fstatat },
         { "getattrlist", &g_rGetattrlist, w_getattrlist }, { "faccessat", &g_rFaccessat, w_faccessat },
@@ -6211,7 +6216,7 @@ static id w_dataFileOpt(id s, SEL c, NSString *p, NSUInteger o, NSError **err) {
 static void MSSwizzle(Class c, SEL s, IMP w, IMP *old) { Method m = class_getInstanceMethod(c, s); if (m) *old = method_setImplementation(m, w); }
 static void MSSaveAudit3(const struct mach_header *mh, intptr_t slide) {
     Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
-    if ([MSConfig()[@"SaveAudit3"] isEqual:@NO]) return;
+    if (![MSConfig()[@"SaveAudit3"] boolValue]) return;          /* diagnostic: only with SaveAudit3 = YES */
     g_gameMH = mh;
     g_rDlsym = dlsym(RTLD_DEFAULT, "dlsym");
     g_rFbOpen = dlsym(RTLD_DEFAULT, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj");
