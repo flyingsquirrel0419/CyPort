@@ -3025,7 +3025,7 @@ static void MSSaveNote(const char *what, const char *path, const char *to, int r
 static BOOL MSSavePath(const char *p);
 FILE *ms_fopen(const char *path, const char *mode) {
     FILE *r = ms_fopen2(path, mode); int e = errno;
-    if (mode && strpbrk(mode, "wa+") && MSSavePath(path)) MSSaveNote("fopen", path, NULL, r ? 0 : -1, e);
+    if (mode && MSSavePath(path)) MSSaveNote(strpbrk(mode, "wa+") ? "fopen write" : "fopen read", path, NULL, r ? 0 : -1, e);
     errno = e; return r;
 }
 /* ---------------------------------------------------------------- external SSD: survive it dropping off the bus
@@ -3163,7 +3163,7 @@ static BOOL MSReopenFd(int fd, off_t off) {
    all, a failed one, or one that went somewhere unexpected */
 static BOOL MSSavePath(const char *p) { return p && strcasestr(p, "save") && !strcasestr(p, "saves-backup"); }
 static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err) {
-    static _Atomic int n; if (n++ >= 300) return;
+    static _Atomic int n; if (n++ >= 600) return;
     static dispatch_once_t once; dispatch_once(&once, ^{
         NSString *as = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
         NSDictionary *a = [NSFileManager.defaultManager attributesOfFileSystemForPath:as error:nil];
@@ -3203,7 +3203,15 @@ int ms_open(const char *path, int flags, ...) {
         int e = errno; if (MSWaitForDrive("open")) fd = MSOpenCase(path, flags, mode); else errno = e;
     }
     if (fd >= 0) MSTrackFd(fd, path);
-    if ((flags & (O_WRONLY | O_RDWR | O_CREAT)) && MSSavePath(path)) { int e = errno; MSSaveNote("write", path, NULL, fd, e); errno = e; }
+    if (MSSavePath(path)) {
+        int e = errno;
+        if (flags & (O_WRONLY | O_RDWR | O_CREAT)) MSSaveNote("write", path, NULL, fd, e);
+        else {                                  /* save audit: the game reading a save (its metadata decides the list) */
+            struct stat st; char tag[64]; snprintf(tag, sizeof tag, "read (%lld bytes)", fd >= 0 && fstat(fd, &st) == 0 ? (long long)st.st_size : -1LL);
+            MSSaveNote(tag, path, NULL, fd, e);
+        }
+        errno = e;
+    }
     return fd;
 }
 int ms_close(int fd) __asm("_close");
