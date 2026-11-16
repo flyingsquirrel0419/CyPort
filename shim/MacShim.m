@@ -3014,7 +3014,7 @@ int ms_stat(const char *path, struct stat *st) __asm("_stat");
 static int ms_stat2(const char *path, struct stat *st) { MS_CASE_RETRY(k_stat(path, st), r != 0, k_stat(f, st)) }
 int ms_stat(const char *path, struct stat *st) {
     int r = ms_stat2(path, st), e = errno;
-    if (r != 0 && MSSavePath(path)) MSSaveNote("stat", path, NULL, r, e);
+    if (MSSavePath(path) && (r != 0 || strstr(path, "Save-"))) MSSaveNote("stat", path, NULL, r, e);
     errno = e; return r;
 }
 int ms_access(const char *path, int m) __asm("_access");
@@ -6036,6 +6036,64 @@ static void MSSteamServicesDump(const struct mach_header *mh, intptr_t slide) {
     else if (!strcmp(f, "CyberpunkGame.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libGameServicesSteam", NO);
 }
 __attribute__((constructor)) static void MSInstallSteamServicesDump(void) { _dyld_register_func_for_add_image(MSSteamServicesDump); }
+
+/* ---------------------------------------------------------------- save audit, part 2 (diagnostic)
+   The Steam build lists the saves folder and each slot's files but never opens a slot's metadata through the calls
+   rerouted at install (open/fopen/stat/access). Whatever else it uses on save paths is caught here: the game
+   program's import slots for these functions are pointed at logging wrappers when it loads. */
+static void *g_rOpenat, *g_rLstat, *g_rFstatat, *g_rGetattrlist, *g_rFaccessat, *g_rUnlink, *g_rRemove, *g_rRmdir, *g_rReaddir, *g_rStat64, *g_rLstat64;
+static void MSSaveNote2(const char *what, const char *path, int r, int err) {
+    if (MSSavePath(path) && !(r < 0 && err == ENOENT && !strstr(path, "Save-"))) MSSaveNote(what, path, NULL, r, err);
+}
+static int w_openat(int fd, const char *p, int fl, int mode) { int r = ((int (*)(int, const char *, int, ...))g_rOpenat)(fd, p, fl, mode), e = errno; MSSaveNote2("openat", p, r, e); errno = e; return r; }
+static int w_lstat(const char *p, struct stat *st) { int r = ((int (*)(const char *, struct stat *))g_rLstat)(p, st), e = errno; MSSaveNote2("lstat", p, r, e); errno = e; return r; }
+static int w_stat64(const char *p, struct stat *st) { int r = ((int (*)(const char *, struct stat *))g_rStat64)(p, st), e = errno; MSSaveNote2("stat64", p, r, e); errno = e; return r; }
+static int w_lstat64(const char *p, struct stat *st) { int r = ((int (*)(const char *, struct stat *))g_rLstat64)(p, st), e = errno; MSSaveNote2("lstat64", p, r, e); errno = e; return r; }
+static int w_fstatat(int fd, const char *p, struct stat *st, int fl) { int r = ((int (*)(int, const char *, struct stat *, int))g_rFstatat)(fd, p, st, fl), e = errno; MSSaveNote2("fstatat", p, r, e); errno = e; return r; }
+static int w_getattrlist(const char *p, void *a, void *b, size_t n, unsigned o) { int r = ((int (*)(const char *, void *, void *, size_t, unsigned))g_rGetattrlist)(p, a, b, n, o), e = errno; MSSaveNote2("getattrlist", p, r, e); errno = e; return r; }
+static int w_faccessat(int fd, const char *p, int m, int fl) { int r = ((int (*)(int, const char *, int, int))g_rFaccessat)(fd, p, m, fl), e = errno; MSSaveNote2("faccessat", p, r, e); errno = e; return r; }
+static int w_unlink(const char *p) { int r = ((int (*)(const char *))g_rUnlink)(p), e = errno; MSSaveNote2("unlink", p, r, e); errno = e; return r; }
+static int w_remove(const char *p) { int r = ((int (*)(const char *))g_rRemove)(p), e = errno; MSSaveNote2("remove", p, r, e); errno = e; return r; }
+static int w_rmdir(const char *p) { int r = ((int (*)(const char *))g_rRmdir)(p), e = errno; MSSaveNote2("rmdir", p, r, e); errno = e; return r; }
+static struct dirent *w_readdir(DIR *d) {
+    struct dirent *r = ((struct dirent *(*)(DIR *))g_rReaddir)(d);
+    static _Atomic int n; if (r && strstr(r->d_name, "Save-") && n++ < 40) MSLogf(@"save: readdir -> %s (type %d)", r->d_name, r->d_type);
+    return r;
+}
+static void MSSaveAudit2(const struct mach_header *mh, intptr_t slide) {
+    Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
+    if ([MSConfig()[@"SaveAudit2"] isEqual:@NO]) return;
+    struct { const char *name; void **real; void *wrap; } t[] = {
+        { "openat", &g_rOpenat, w_openat }, { "lstat", &g_rLstat, w_lstat }, { "fstatat", &g_rFstatat, w_fstatat },
+        { "getattrlist", &g_rGetattrlist, w_getattrlist }, { "faccessat", &g_rFaccessat, w_faccessat },
+        { "unlink", &g_rUnlink, w_unlink }, { "remove", &g_rRemove, w_remove }, { "rmdir", &g_rRmdir, w_rmdir },
+        { "readdir", &g_rReaddir, w_readdir }, { "stat64", &g_rStat64, w_stat64 }, { "lstat64", &g_rLstat64, w_lstat64 },
+    };
+    size_t nt = sizeof t / sizeof *t; void *addr[16];
+    for (size_t k = 0; k < nt; k++) { addr[k] = dlsym(RTLD_DEFAULT, t[k].name); *t[k].real = addr[k]; }
+    int hits[16] = { 0 };
+    const char *segs[][2] = { { "__DATA_CONST", "__got" }, { "__DATA", "__got" }, { "__DATA", "__la_symbol_ptr" }, { "__AUTH_CONST", "__auth_got" } };
+    for (size_t g = 0; g < sizeof segs / sizeof *segs; g++) {
+        unsigned long sz = 0; uint8_t *sec = getsectiondata((const struct mach_header_64 *)mh, segs[g][0], segs[g][1], &sz);
+        for (unsigned long o = 0; sec && o + 8 <= sz; o += 8) {
+            void **slot = (void **)(sec + o);
+            for (size_t k = 0; k < nt; k++) {
+                if (!addr[k] || *slot != addr[k]) continue;
+                vm_address_t pg = (vm_address_t)slot & ~(vm_address_t)0x3fff;
+                vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                *slot = t[k].wrap; hits[k]++;
+                vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ);
+            }
+        }
+    }
+    NSMutableArray *a = [NSMutableArray array];
+    for (size_t k = 0; k < nt; k++) [a addObject:[NSString stringWithFormat:@"%s %d", t[k].name, hits[k]]];
+    MSLogf(@"save audit 2: game import slots wrapped: %@", [a componentsJoinedByString:@", "]);
+    MSDumpSymbols((const void *)mh, slide, "CyberpunkGame.dylib", "libSystem", NO);
+    MSDumpSymbols((const void *)mh, slide, "CyberpunkGame.dylib", "libc++", NO);
+    MSDumpSymbols((const void *)mh, slide, "CyberpunkGame.dylib", "Foundation", NO);
+}
+__attribute__((constructor)) static void MSInstallSaveAudit2(void) { _dyld_register_func_for_add_image(MSSaveAudit2); }
 
 /* ---------------------------------------------------------------- Bink video (rerouted from libBink2MacArm64) */
 static void *MSBink(const char *sym) {
