@@ -5992,6 +5992,51 @@ static void MSPatchGalaxy(const struct mach_header *mh, intptr_t slide) {
 }
 __attribute__((constructor)) static void MSInstallGalaxyPatch(void) { _dyld_register_func_for_add_image(MSPatchGalaxy); }
 
+/* ---------------------------------------------------------------- Steam game services: what they use (diagnostic)
+   With no Steam client on iOS, SteamAPI_Init fails and the Steam build's game services show no saves. To fake a
+   signed-in Steam user, the exact Steam calls libGameServicesSteam makes are needed: this logs its imports from
+   libsteam_api, its own exported functions, and what the game program imports from it. */
+#include <mach-o/nlist.h>
+static void MSDumpSymbols(const struct mach_header_64 *mh, intptr_t slide, const char *tag, const char *fromLib, BOOL exports) {
+    const struct load_command *lc = (const void *)(mh + 1);
+    const struct symtab_command *st = NULL; const struct segment_command_64 *le = NULL;
+    const char *libs[256] = { 0 }; int nlibs = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_SYMTAB) st = (const void *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT")) le = (const void *)lc;
+        else if ((lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB || lc->cmd == LC_REEXPORT_DYLIB || lc->cmd == LC_LOAD_UPWARD_DYLIB) && nlibs < 255)
+            libs[++nlibs] = (const char *)lc + ((const struct dylib_command *)lc)->dylib.name.offset;
+    }
+    if (!st || !le) { MSLogf(@"steam services: %s has no symbol table", tag); return; }
+    uintptr_t base = le->vmaddr + slide - le->fileoff;
+    const struct nlist_64 *nl = (const void *)(base + st->symoff); const char *strs = (const char *)(base + st->stroff);
+    NSMutableArray *imp = [NSMutableArray array], *exp = [NSMutableArray array];
+    for (uint32_t i = 0; i < st->nsyms; i++) {
+        if (nl[i].n_type & N_STAB) continue;
+        const char *name = strs + nl[i].n_un.n_strx;
+        if ((nl[i].n_type & N_TYPE) == N_UNDF && (nl[i].n_type & N_EXT)) {
+            int ord = GET_LIBRARY_ORDINAL(nl[i].n_desc);
+            if (fromLib && ord > 0 && ord <= nlibs && strstr(libs[ord], fromLib)) [imp addObject:@(name)];
+        } else if (exports && (nl[i].n_type & N_TYPE) == N_SECT && (nl[i].n_type & N_EXT))
+            [exp addObject:[NSString stringWithFormat:@"%s@%llx", name, (unsigned long long)(nl[i].n_value)]];
+    }
+    void (^out)(NSString *, NSArray *) = ^(NSString *what, NSArray *a) {
+        MSLogf(@"steam services: %s %@ (%lu):", tag, what, (unsigned long)a.count);
+        for (NSUInteger k = 0; k < a.count && k < 1500; k += 12)
+            MSLogf(@"steam services:   %@", [[a subarrayWithRange:NSMakeRange(k, MIN(12, a.count - k))] componentsJoinedByString:@" "]);
+    };
+    if (fromLib) out([NSString stringWithFormat:@"imports from %s", fromLib], imp);
+    if (exports) out(@"exports", exp);
+}
+static void MSSteamServicesDump(const struct mach_header *mh, intptr_t slide) {
+    if ([MSConfig()[@"SteamSymbolDump"] isEqual:@NO]) return;
+    Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname) return;
+    const char *f = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+    if (!strcmp(f, "libGameServicesSteam.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libsteam_api", YES);
+    else if (!strcmp(f, "CyberpunkGame.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libGameServicesSteam", NO);
+}
+__attribute__((constructor)) static void MSInstallSteamServicesDump(void) { _dyld_register_func_for_add_image(MSSteamServicesDump); }
+
 /* ---------------------------------------------------------------- Bink video (rerouted from libBink2MacArm64) */
 static void *MSBink(const char *sym) {
     static void *h; if (!h) h = dlopen("@rpath/libBink2MacArm64.dylib", RTLD_LAZY | RTLD_NOLOAD); if (!h) h = dlopen("@rpath/libBink2MacArm64.dylib", RTLD_LAZY);
