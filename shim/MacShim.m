@@ -2989,7 +2989,20 @@ static void MSNotePath(const char *fn, const char *path) {
     if ((FAILED) && errno == ENOENT) { char *f = MSCaseFix(path); if (f) { r = CALL_FIXED; free(f); } else errno = ENOENT; } \
     return r;
 DIR *ms_opendir(const char *path) __asm("_opendir");
-DIR *ms_opendir(const char *path) { MS_CASE_RETRY(k_opendir(path), !r, k_opendir(f)) }
+static DIR *ms_opendir2(const char *path) { MS_CASE_RETRY(k_opendir(path), !r, k_opendir(f)) }
+static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err);
+static BOOL MSSavePath(const char *p);
+DIR *ms_opendir(const char *path) {
+    DIR *r = ms_opendir2(path); int e = errno;
+    if (MSSavePath(path)) {                     /* save audit: what the game sees when it lists a save folder */
+        NSArray *items = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(path) error:nil];
+        NSString *names = [[items sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "];
+        if (names.length > 300) names = [[names substringToIndex:300] stringByAppendingString:@"..."];
+        char tag[512]; snprintf(tag, sizeof tag, "list (%lu: %s)", (unsigned long)items.count, names.UTF8String ?: "");
+        MSSaveNote(tag, path, NULL, r ? 0 : -1, e);
+    }
+    errno = e; return r;
+}
 char *ms_realpath(const char *path, char *out) __asm("_realpath$DARWIN_EXTSN");
 static char *ms_realpath2(const char *path, char *out) { MS_CASE_RETRY(k_realpath(path, out), !r, k_realpath(f, out)) }
 char *ms_realpath(const char *path, char *out) {
@@ -2998,7 +3011,12 @@ char *ms_realpath(const char *path, char *out) {
     return r;
 }
 int ms_stat(const char *path, struct stat *st) __asm("_stat");
-int ms_stat(const char *path, struct stat *st) { MS_CASE_RETRY(k_stat(path, st), r != 0, k_stat(f, st)) }
+static int ms_stat2(const char *path, struct stat *st) { MS_CASE_RETRY(k_stat(path, st), r != 0, k_stat(f, st)) }
+int ms_stat(const char *path, struct stat *st) {
+    int r = ms_stat2(path, st), e = errno;
+    if (r != 0 && MSSavePath(path)) MSSaveNote("stat", path, NULL, r, e);
+    errno = e; return r;
+}
 int ms_access(const char *path, int m) __asm("_access");
 int ms_access(const char *path, int m) { MS_CASE_RETRY(k_access(path, m), r != 0, k_access(f, m)) }
 FILE *ms_fopen(const char *path, const char *mode) __asm("_fopen");
@@ -5079,7 +5097,35 @@ static void ms_drPresent(id self, SEL c) {                      /* -[CAMetalDraw
     if (T > 0 || U > 0) ((void (*)(id, SEL, CFTimeInterval))(g_oDrPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentAfterMinimumDuration:))))(self, @selector(presentAfterMinimumDuration:), T > 0 ? T - 0.002 : MSCapMargin(U));
     else ((void (*)(id, SEL))g_oDrPresent)(self, c);
 }
+/* Going to the background: GPU work the game still had queued fails with "not permitted" (iOS doesn't let a background
+   app use the GPU), and the game treats any failed command buffer as fatal - the crash in a Metal completion handler
+   every time the app was left. Such a buffer reports success instead (its picture is never shown anyway). */
+static IMP g_oCBStatus, g_oCBError;
+static BOOL MSBgGPUError(id cb) {
+    NSError *e = ((NSError *(*)(id, SEL))g_oCBError)(cb, @selector(error));
+    return e && [e.domain isEqualToString:MTLCommandBufferErrorDomain] && (e.code == MTLCommandBufferErrorNotPermitted || (g_inBackground && e.code != MTLCommandBufferErrorOutOfMemory));
+}
+static MTLCommandBufferStatus ms_cbStatus(id self, SEL c) {
+    MTLCommandBufferStatus st = ((MTLCommandBufferStatus (*)(id, SEL))g_oCBStatus)(self, c);
+    if (st == MTLCommandBufferStatusError && MSBgGPUError(self)) {
+        static _Atomic int n; if (n++ < 5) MSLogf(@"background: GPU work refused by iOS (%@) - reported as done", ((NSError *(*)(id, SEL))g_oCBError)(self, @selector(error)).localizedDescription);
+        return MTLCommandBufferStatusCompleted;
+    }
+    return st;
+}
+static NSError *ms_cbError(id self, SEL c) {
+    NSError *e = ((NSError *(*)(id, SEL))g_oCBError)(self, c);
+    return e && MSBgGPUError(self) ? nil : e;
+}
+static void MSInstallBgGPU(id<MTLCommandBuffer> cb) {
+    if ([MSConfig()[@"BackgroundGPUMask"] isEqual:@NO] || !cb || g_oCBStatus) return;
+    Method ms = class_getInstanceMethod(object_getClass(cb), @selector(status)), me = class_getInstanceMethod(object_getClass(cb), @selector(error));
+    if (!ms || !me) return;
+    g_oCBError = method_getImplementation(me); g_oCBStatus = method_setImplementation(ms, (IMP)ms_cbStatus);
+    method_setImplementation(me, (IMP)ms_cbError);
+}
 static void MSInstallPacing(void) {
+    { id<MTLDevice> d = MTLCreateSystemDefaultDevice(); MSInstallBgGPU([[d newCommandQueue] commandBuffer]); }
     if ([MSConfig()[@"FramePacing"] isEqual:@NO]) { MSLogf(@"frame pacing: off (FramePacing = NO)"); return; }
     Method m = class_getInstanceMethod(CAMetalLayer.class, @selector(nextDrawable));
     if (m && !g_origNextDrawable) g_origNextDrawable = method_setImplementation(m, (IMP)ms_nextDrawable);

@@ -585,10 +585,31 @@ enum SteamCloud {
         let cm = SteamStore.shared.cm, app = UInt64(Game.steamApp)
         var b = PBWriter(); b.u(1, app); b.s(2, "CyPort (iPhone)")
         for (_, n) in named { b.s(3, n) }
-        let batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0
-        func complete(_ ok: Bool) async {
-            var c = PBWriter(); c.u(1, app); c.u(2, batch); c.u(3, ok ? 1 : 2)
+        // an upload cut off earlier (connection lost, app closed) leaves its batch open on Steam's side, and Steam then
+        // refuses new ones (result 108, too many pending): close the one remembered, and on 108 try once more
+        let openKey = "CyPortSteamOpenUploadBatch"
+        func close(_ id: UInt64, _ ok: Bool) async {
+            var c = PBWriter(); c.u(1, app); c.u(2, id); c.u(3, ok ? 1 : 2)
             _ = try? await cm.service("Cloud.CompleteAppUploadBatchBlocking#1", c, authed: true)
+        }
+        func closeStale() async -> Bool {
+            guard let s = UserDefaults.standard.string(forKey: openKey), let id = UInt64(s) else { return false }
+            await close(id, false); UserDefaults.standard.removeObject(forKey: openKey)
+            GameCloud.log("Steam: closed upload batch \(id) left open by an earlier upload")
+            return true
+        }
+        _ = await closeStale()
+        let batch: UInt64
+        do { batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0 }
+        catch let e as SteamResult where e.code == 108 {
+            GameCloud.log("Steam: too many uploads pending (108) - waiting for Steam to drop them, then trying again")
+            try await Task.sleep(nanoseconds: 20_000_000_000)
+            batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0
+        }
+        UserDefaults.standard.set(String(batch), forKey: openKey)
+        func complete(_ ok: Bool) async {
+            await close(batch, ok)
+            UserDefaults.standard.removeObject(forKey: openKey)
         }
         do {
             for (f, name) in named {
