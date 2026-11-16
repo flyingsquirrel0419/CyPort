@@ -6229,6 +6229,121 @@ static void MSSaveAudit3(const struct mach_header *mh, intptr_t slide) {
 }
 __attribute__((constructor)) static void MSInstallSaveAudit3(void) { _dyld_register_func_for_add_image(MSSaveAudit3); }
 
+/* ---------------------------------------------------------------- save code dump (diagnostic)
+   The Steam build lists every slot and then drops them without reading a single file; the reason is only in the
+   game's own code. The functions that use the save file names (sav.dat, metadata, ManualSave, ...) are written,
+   compressed, to Documents/save_code_dump.txt, with the strings they use. SaveCodeDump = NO turns it off. */
+#include <mach-o/loader.h>
+static uint64_t MSUleb(const uint8_t **p, const uint8_t *end) {
+    uint64_t v = 0; int s = 0; while (*p < end) { uint8_t b = *(*p)++; v |= (uint64_t)(b & 0x7f) << s; s += 7; if (!(b & 0x80)) break; } return v;
+}
+static void MSSaveCodeDump(const struct mach_header *mh0, intptr_t slide) {
+    Dl_info di; if (!dladdr(mh0, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
+    if ([MSConfig()[@"SaveCodeDump"] isEqual:@NO]) return;
+    const struct mach_header_64 *mh = (const void *)mh0;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        const struct load_command *lc = (const void *)(mh + 1);
+        const struct segment_command_64 *le = NULL, *tx = NULL; const struct linkedit_data_command *fs = NULL; const struct symtab_command *st = NULL;
+        for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+            if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT")) le = (const void *)lc;
+            else if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__TEXT")) tx = (const void *)lc;
+            else if (lc->cmd == LC_FUNCTION_STARTS) fs = (const void *)lc;
+            else if (lc->cmd == LC_SYMTAB) st = (const void *)lc;
+        }
+        unsigned long tsz = 0, csz = 0;
+        const uint8_t *text = getsectiondata(mh, "__TEXT", "__text", &tsz), *cstr = getsectiondata(mh, "__TEXT", "__cstring", &csz);
+        if (!le || !tx || !fs || !text || !cstr) { MSLogf(@"save code dump: game has no %s", !fs ? "function starts" : "text/cstring"); return; }
+        uintptr_t lbase = le->vmaddr + slide - le->fileoff;
+        /* 1. the save strings */
+        const char *keys[] = { "metadata", "sav.dat", "Save-", "ManualSave", "AutoSave", "QuickSave", "PointOfNoReturn", "EndGameSave",
+                               "user.gls", "SaveGame", "savegame", "Savegame", "SaveLoad", "saveLoad", "SaveSystem", "CloudSave", "PlatformToken" };
+        NSMutableIndexSet *hitStr = [NSMutableIndexSet indexSet];            /* offsets in __cstring */
+        for (unsigned long o = 0; o < csz; ) {
+            const char *s = (const char *)cstr + o; size_t n = strnlen(s, csz - o);
+            for (size_t k = 0; k < sizeof keys / sizeof *keys; k++) if (strstr(s, keys[k])) { [hitStr addIndex:o]; break; }
+            o += n + 1;
+        }
+        uint64_t cAddr = (uint64_t)(uintptr_t)cstr, tAddr = (uint64_t)(uintptr_t)text;
+        /* 2. function starts */
+        NSMutableArray<NSNumber *> *starts = [NSMutableArray array];
+        { const uint8_t *p = (const uint8_t *)(lbase + fs->dataoff), *e = p + fs->datasize; uint64_t a = tx->vmaddr + slide;
+          while (p < e) { uint64_t d = MSUleb(&p, e); if (!d) break; a += d; [starts addObject:@(a)]; } }
+        /* 3. code referring to the strings: adrp xN + add xN, xN, #lo within 4 instructions */
+        const uint32_t *ins = (const void *)text; size_t ni = tsz / 4;
+        NSMutableIndexSet *funcs = [NSMutableIndexSet indexSet]; NSMutableDictionary *why = [NSMutableDictionary dictionary];
+        for (size_t i = 0; i < ni; i++) {
+            uint32_t a = ins[i]; if ((a & 0x9f000000) != 0x90000000) continue;
+            uint64_t pc = tAddr + i * 4, rd = a & 31;
+            int64_t imm = ((int64_t)(((a >> 5) & 0x7ffff) << 2 | ((a >> 29) & 3)) << 43) >> 31;
+            uint64_t page = (pc & ~0xfffULL) + imm;
+            if (page + 0x1000 <= cAddr || page >= cAddr + csz) continue;
+            for (size_t j = i + 1; j < ni && j <= i + 4; j++) {
+                uint32_t b = ins[j];
+                if ((b & 0xffc00000) == 0x91000000 && ((b >> 5) & 31) == rd) {
+                    uint64_t tgt = page + ((b >> 10) & 0xfff);
+                    if (tgt >= cAddr && tgt < cAddr + csz && [hitStr containsIndex:(NSUInteger)(tgt - cAddr)]) {
+                        /* containing function: last start <= pc */
+                        NSUInteger lo = 0, hi = starts.count;
+                        while (lo < hi) { NSUInteger m = (lo + hi) / 2; if (starts[m].unsignedLongLongValue <= pc) lo = m + 1; else hi = m; }
+                        if (lo) { [funcs addIndex:lo - 1]; why[@(lo - 1)] = @((const char *)(uintptr_t)tgt); }
+                    }
+                    break;
+                }
+            }
+        }
+        /* 4. write: functions (unslid address, bytes) + every string they refer to */
+        NSMutableData *blob = [NSMutableData data]; NSMutableString *idx = [NSMutableString string];
+        __block NSUInteger nf = 0, total = 0;
+        [funcs enumerateIndexesUsingBlock:^(NSUInteger k, BOOL *stop) {
+            uint64_t s = starts[k].unsignedLongLongValue, e = k + 1 < starts.count ? starts[k + 1].unsignedLongLongValue : tAddr + tsz;
+            uint64_t len = MIN(e - s, 0x4000ULL);
+            if (total + len > 0x40000 || nf >= 80) { *stop = YES; return; }
+            [idx appendFormat:@"F %llx %llx %@\n", s - slide, len, [[why[@(k)] description] stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]];
+            [blob appendBytes:(const void *)(uintptr_t)s length:(NSUInteger)len]; total += len; nf++;
+            MSLogf(@"save code dump: function %llx, %llu bytes, uses \"%@\"", s - slide, len, why[@(k)]);
+            /* strings used inside */
+            const uint32_t *f = (const void *)(uintptr_t)s;
+            for (uint64_t i = 0; i + 1 < len / 4; i++) {
+                uint32_t a = f[i]; if ((a & 0x9f000000) != 0x90000000) continue;
+                uint64_t pc = s + i * 4, rd = a & 31;
+                int64_t imm = ((int64_t)(((a >> 5) & 0x7ffff) << 2 | ((a >> 29) & 3)) << 43) >> 31;
+                uint64_t page = (pc & ~0xfffULL) + imm;
+                for (uint64_t j = i + 1; j < len / 4 && j <= i + 4; j++) {
+                    uint32_t b = f[j];
+                    if ((b & 0xffc00000) == 0x91000000 && ((b >> 5) & 31) == rd) {
+                        uint64_t tgt = page + ((b >> 10) & 0xfff);
+                        if (tgt >= cAddr && tgt < cAddr + csz) {
+                            NSString *str = [[NSString alloc] initWithBytes:(const void *)(uintptr_t)tgt length:strnlen((const char *)(uintptr_t)tgt, 160) encoding:NSUTF8StringEncoding] ?: @"?";
+                            [idx appendFormat:@"S %llx %@\n", tgt - slide, [str stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]];
+                        }
+                        break;
+                    }
+                }
+            }
+        }];
+        /* named functions, if the game kept any local symbols */
+        NSUInteger nsym = 0;
+        if (st) {
+            const struct nlist_64 *nl = (const void *)(lbase + st->symoff); const char *strs = (const char *)(lbase + st->stroff);
+            for (uint32_t i = 0; i < st->nsyms; i++) if (!(nl[i].n_type & N_STAB) && (nl[i].n_type & N_TYPE) == N_SECT) nsym++;
+        }
+        [idx insertString:[NSString stringWithFormat:@"slide %lx, __text %llx size %lx, __cstring %llx size %lx, %lu function starts, %lu defined symbols, %lu save strings\n",
+                           (long)slide, tAddr - slide, tsz, cAddr - slide, csz, (unsigned long)starts.count, (unsigned long)nsym, (unsigned long)hitStr.count] atIndex:0];
+        NSData *idxD = [idx dataUsingEncoding:NSUTF8StringEncoding];
+        uint32_t il = (uint32_t)idxD.length; NSMutableData *all = [NSMutableData dataWithBytes:&il length:4];
+        [all appendData:idxD]; [all appendData:blob];
+        NSData *z = [all compressedDataUsingAlgorithm:NSDataCompressionAlgorithmZlib error:nil];
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *out = [docs stringByAppendingPathComponent:@"save_code_dump.txt"];
+        NSString *b64 = [z base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength];
+        BOOL ok = b64 && [[NSString stringWithFormat:@"CYPORT-CODE %lu functions %lu bytes, u32 index length + index + code, zlib(raw deflate)+base64\n%@\nEND\n",
+                           (unsigned long)nf, (unsigned long)total, b64] writeToFile:out atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        MSLogf(@"save code dump: %lu save strings, %lu functions use them, %lu written (%lu bytes -> %lu characters) %@ in %@",
+               (unsigned long)hitStr.count, (unsigned long)funcs.count, (unsigned long)nf, (unsigned long)total, (unsigned long)b64.length, ok ? @"ok" : @"FAILED", out);
+    });
+}
+__attribute__((constructor)) static void MSInstallSaveCodeDump(void) { _dyld_register_func_for_add_image(MSSaveCodeDump); }
+
 /* ---------------------------------------------------------------- Bink video (rerouted from libBink2MacArm64) */
 static void *MSBink(const char *sym) {
     static void *h; if (!h) h = dlopen("@rpath/libBink2MacArm64.dylib", RTLD_LAZY | RTLD_NOLOAD); if (!h) h = dlopen("@rpath/libBink2MacArm64.dylib", RTLD_LAZY);
