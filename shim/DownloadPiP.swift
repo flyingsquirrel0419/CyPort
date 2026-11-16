@@ -1,12 +1,14 @@
 // DownloadPiP.swift - keeps a download going when you leave the app: the download screens show a small live card
 // (progress drawn into a video layer); going to the Home Screen turns it into a Picture in Picture window, and iOS
 // keeps an app with a playing PiP window running. Needs UIBackgroundModes audio (app/Info.plist) and the .playback
-// audio session, only while a download runs (the game itself doesn't use it).
+// audio session while a download runs; afterwards the game's own Playback session (shim/MacShim.m) stays if it plays sound.
 import AVFoundation
 import AVKit
 import CoreMedia
 import SwiftUI
 import UIKit
+@_silgen_name("MSGameAudioActive") private func MSGameAudioActive() -> Int32     // shim/MacShim.m
+@_silgen_name("MSGameAudioSession") private func MSGameAudioSession()
 
 @MainActor
 final class DownloadPiP: NSObject, ObservableObject {
@@ -68,7 +70,9 @@ final class DownloadPiP: NSObject, ObservableObject {
         controller?.stopPictureInPicture()
         layer.flush()
         silence?.stop(); silence = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // the game's own sound (an update while it runs) keeps its session; otherwise give the audio back to other apps
+        if MSGameAudioActive() != 0 { MSGameAudioSession() }
+        else { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
     }
 
     private func startSilence() {
