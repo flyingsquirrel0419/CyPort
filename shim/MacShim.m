@@ -17,6 +17,7 @@
 #import <Metal/Metal.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/message.h>
+#import <AVFoundation/AVFoundation.h>
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <crt_externs.h>
@@ -5639,8 +5640,22 @@ static void MSHookGameWindow(void) {
     MSLogf(@"output resolution hooks: %d %d (method types %s / %s)", m != NULL, k != NULL, m ? method_getTypeEncoding(m) : "-", k ? method_getTypeEncoding(k) : "-");
 }
 
+/* The game's sound goes out through the speaker too: without a category iOS uses SoloAmbient, which the silent switch
+ * mutes (only headphones played). Playback ignores the switch, like other games with sound; set before any output starts
+ * and again on returning to the foreground (a download's PiP card may have changed it in between). */
+void MSGameAudioSession(void) {
+    AVAudioSession *s = AVAudioSession.sharedInstance; NSError *e = nil;
+    if (![s.category isEqualToString:AVAudioSessionCategoryPlayback] || s.categoryOptions != 0 || ![s.mode isEqualToString:AVAudioSessionModeDefault])
+        if (![s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&e]) MSLogf(@"audio: session category: %@", e);
+    if (![s setActive:YES error:&e]) MSLogf(@"audio: session activate: %@", e);
+    static dispatch_once_t once; dispatch_once(&once, ^{ MSLogf(@"audio: session Playback (speaker, ignores the silent switch), route %@", s.currentRoute.outputs.firstObject.portType); });
+}
+static _Atomic int g_gameAudio;
+int MSGameAudioActive(void) { return g_gameAudio; }
+
 static IMP g_origEngineStart;
 static BOOL ms_engineStart(id self, SEL _cmd, NSError **err) {
+    g_gameAudio = 1; MSGameAudioSession();
     @synchronized (g_audioEngines) { [g_audioEngines addObject:self]; }
     return ((BOOL (*)(id, SEL, NSError **))g_origEngineStart)(self, _cmd, err);
 }
@@ -5658,6 +5673,7 @@ static void MSInstallBackgroundFreeze(void) {
     }];
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         if (!g_inBackground) return;
+        if (g_gameAudio) MSGameAudioSession();
         NSArray *es; @synchronized (g_audioEngines) { es = g_audioEngines.allObjects; }
         for (id e in es) { NSError *er = nil;
             if (!((BOOL (*)(id, SEL, NSError **))objc_msgSend)(e, NSSelectorFromString(@"startAndReturnError:"), &er)) MSLogf(@"foreground: audio engine restart failed: %@", er); }
@@ -5763,6 +5779,7 @@ OSStatus ms_AUGraphStart(AUGraph g) __asm("_AUGraphStart");
 OSStatus ms_AUGraphStart(AUGraph g) {
     static OSStatus (*real)(AUGraph); if (!real) real = MSAudioToolbox("AUGraphStart");
     if ([MSConfig()[@"NoAudio"] boolValue]) { MSLogf(@"audio: AUGraphStart skipped (NoAudio)"); return noErr; }
+    g_gameAudio = 1; MSGameAudioSession();
     OSStatus r = real(g); MSLogf(@"audio: AUGraphStart -> %d", (int)r); return r;
 }
 
