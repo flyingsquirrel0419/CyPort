@@ -71,7 +71,7 @@ enum MachORetarget {
         log += rerouteImports(&d, m)
         if m.ftype == 2 {
             log += patchPoolEnd(&d, m); log += patchWatchdog(&d, m); log += patchPoolSizes(&d, gb: poolGB); log += patchFreeHook(&d, m)
-        }
+        } else { log += patchSteamSignIn(&d, m) }
         log += try dedupeDylibs(&d, m)
         if m.ftype == 2 { log += makeLoadable(&d, try parse(d)) }
         if m.ftype != 2 { log += try addRpath(&d, "@loader_path") }
@@ -170,6 +170,36 @@ enum MachORetarget {
             }
         }
         return out
+    }
+
+    /// libGameServicesSteam (Steam Mac build): with no Steam client SteamAPI_Init fails, Initialize answers -1 and SignIn
+    /// calls back "not signed in" - and the game then lists no saves (its saves folder is read but every slot dropped;
+    /// new saves always go to ManualSave-0). Like the GOG build's fake sign-in, SignIn now calls back "signed in" at
+    /// once and Initialize answers ok. Every other function there checks Steam itself (its initialized flag / null
+    /// interfaces), so nothing else reaches the missing Steam. Same as patch_steam_signin in ios_retarget.py.
+    static func patchSteamSignIn(_ d: inout [UInt8], _ m: Header) -> [String] {
+        var syms: [String: UInt64] = [:], steam = false, text: (UInt64, UInt64)?
+        for c in m.cmds {
+            if c.cmd == LC_SEGMENT_64 && cstr(d, c.off + 8, c.off + 24) == "__TEXT" { text = (u64(d, c.off + 24), u64(d, c.off + 40)) }
+            if c.cmd == LC_SYMTAB {
+                let symoff = Int(u32(d, c.off + 8)), nsyms = Int(u32(d, c.off + 12)), stroff = Int(u32(d, c.off + 16))
+                for i in 0..<nsyms {
+                    let e = symoff + 16 * i, strx = stroff + Int(u32(d, e)), typ = d[e + 4]
+                    let name = cstr(d, strx, min(strx + 128, d.count))
+                    if name.contains("GameServicesSteam6SignIn") { steam = true }
+                    if typ & 0x0f == 0x0f && (name == "_SignIn" || name == "_Initialize") { syms[name] = u64(d, e + 8) }
+                }
+            }
+        }
+        guard steam else { return [] }
+        guard let text, let si = syms["_SignIn"], let ii = syms["_Initialize"] else { return ["steam sign-in patch: symbols missing; NOT applied"] }
+        let s = Int(text.1 + si - text.0), i = Int(text.1 + ii - text.0)
+        guard s + 12 <= d.count, i + 0x1c <= d.count, u32(d, s) == 0xaa0103e2, u32(d, s + 4) == 0xaa0003e1, u32(d, i + 0x18) == 0x51000400 else {
+            return ["steam sign-in patch: unexpected code; NOT applied"]
+        }
+        put32(&d, s, 0xaa0003e2); put32(&d, s + 4, 0x52800020); put32(&d, s + 8, 0xd61f0040)     // mov x2,x0 ; mov w0,#1 ; br x2
+        put32(&d, i + 0x18, 0x52800000)                                                         // mov w0,#0
+        return ["steam sign-in patch: SignIn answers signed in, Initialize answers ok (no Steam client on iOS)"]
     }
 
     static func addRpath(_ d: inout [UInt8], _ path: String) throws -> [String] {

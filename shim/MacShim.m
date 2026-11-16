@@ -6032,23 +6032,7 @@ static void MSSteamServicesDump(const struct mach_header *mh, intptr_t slide) {
     if ([MSConfig()[@"SteamSymbolDump"] isEqual:@NO]) return;
     Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname) return;
     const char *f = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
-    if (!strcmp(f, "libGameServicesSteam.dylib")) {
-        MSDumpSymbols((const void *)mh, slide, f, "libsteam_api", YES);
-        /* the library itself, compressed, as text in Documents/steam_services_dump.txt: what it does when Steam is
-           missing (and so what to answer instead) is only readable from its code */
-        NSString *src = @(di.dli_fname);
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            NSData *d = [NSData dataWithContentsOfFile:src];
-            NSData *z = d ? [d compressedDataUsingAlgorithm:NSDataCompressionAlgorithmZlib error:nil] : nil;
-            NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            NSString *out = [docs stringByAppendingPathComponent:@"steam_services_dump.txt"];
-            NSString *b64 = [z base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength];
-            BOOL ok = b64 && [[NSString stringWithFormat:@"CYPORT-DUMP libGameServicesSteam.dylib %lu bytes, zlib(raw deflate)+base64\n%@\nEND\n",
-                               (unsigned long)d.length, b64] writeToFile:out atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            MSLogf(@"steam services: library dump %@ (%lu bytes -> %lu characters) in %@", ok ? @"written" : @"FAILED",
-                   (unsigned long)d.length, (unsigned long)b64.length, out);
-        });
-    }
+    if (!strcmp(f, "libGameServicesSteam.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libsteam_api", YES);
     else if (!strcmp(f, "CyberpunkGame.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libGameServicesSteam", NO);
 }
 __attribute__((constructor)) static void MSInstallSteamServicesDump(void) { _dyld_register_func_for_add_image(MSSteamServicesDump); }

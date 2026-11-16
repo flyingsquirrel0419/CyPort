@@ -148,6 +148,7 @@ def retarget(src, dst, minos, sdk):
     if not seen: raise SystemExit("no LC_BUILD_VERSION: not a modern macOS build")
     log += reroute_imports(d, m)
     if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m)      # MH_EXECUTE
+    else: log += patch_steam_signin(d, m)
     log += dedupe_dylibs(d, m)          # it moves load commands, so m["cmds"] offsets are stale afterwards
     if GAME_FOLDER and m["ftype"] == 2: log += make_loadable(d, parse(d))
     if GAME_FOLDER:
@@ -414,6 +415,36 @@ def patch_free_hook(d, m):
     ldr = 0xf9400210 | (((slot & 0xfff) // 8) << 10)
     struct.pack_into("<3I", d, fo, adrp, ldr, 0xd61f0200)
     return ["free hook: engine Free %#x -> through slot %#x (shim quarantine)" % (FREE_ENTRY, slot)]
+
+STEAM_SIGNIN = (0xaa0103e2, 0xaa0003e1)          # SignIn(cb, ctx): mov x2,x1 ; mov x1,x0 ; adrp/add this ; b GameServicesSteam::SignIn
+STEAM_INIT_SUB = 0x51000400                         # Initialize: ... sub w0,w0,#1 (0 = ok, -1 = failed)
+
+def patch_steam_signin(d, m):
+    """libGameServicesSteam (Steam Mac build): with no Steam client SteamAPI_Init fails, Initialize answers -1 and
+    SignIn calls back "not signed in" - and the game then lists no saves (its own saves folder is read but every
+    slot dropped; new saves always go to ManualSave-0). Like the GOG build's fake sign-in, SignIn now calls back
+    "signed in" right away and Initialize answers ok. Every other function there checks Steam itself (its own
+    initialized flag / null interfaces), so nothing else reaches the missing Steam."""
+    syms = {}; steam = False; text = None
+    for cmd, off, sz in m["cmds"]:
+        if cmd == LC_SEGMENT_64 and cstr(d[off + 8:off + 24]) == "__TEXT":
+            text = struct.unpack_from("<QQQ", d, off + 24)          # vmaddr, vmsize, fileoff
+        if cmd == 0x2:                                                  # LC_SYMTAB
+            symoff, nsyms, stroff = struct.unpack_from("<III", d, off + 8)
+            for i in range(nsyms):
+                strx, typ, sect, desc, val = struct.unpack_from("<IBBHQ", d, symoff + 16 * i)
+                name = cstr(d[stroff + strx:stroff + strx + 128])
+                if "GameServicesSteam6SignIn" in name: steam = True
+                if typ & 0x0f == 0x0f and name in ("_SignIn", "_Initialize"): syms[name] = val
+    if not steam: return []
+    if not text or len(syms) != 2: return ["steam sign-in patch: symbols missing; NOT applied"]
+    fo = lambda a: text[2] + a - text[0]
+    s, i = fo(syms["_SignIn"]), fo(syms["_Initialize"])
+    if struct.unpack_from("<2I", d, s) != STEAM_SIGNIN or struct.unpack_from("<I", d, i + 0x18)[0] != STEAM_INIT_SUB:
+        return ["steam sign-in patch: unexpected code; NOT applied"]
+    struct.pack_into("<3I", d, s, 0xaa0003e2, 0x52800020, 0xd61f0040)      # mov x2,x0 ; mov w0,#1 ; br x2
+    struct.pack_into("<I", d, i + 0x18, 0x52800000)                         # mov w0,#0
+    return ["steam sign-in patch: SignIn answers signed in, Initialize answers ok (no Steam client on iOS)"]
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
