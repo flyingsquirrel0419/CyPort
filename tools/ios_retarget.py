@@ -147,7 +147,7 @@ def retarget(src, dst, minos, sdk):
                 log.append("%s -> %s" % (old, new))
     if not seen: raise SystemExit("no LC_BUILD_VERSION: not a modern macOS build")
     log += reroute_imports(d, m)
-    if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m)      # MH_EXECUTE
+    if m["ftype"] == 2: log += patch_pool_end(d, m) + patch_watchdog(d, m) + patch_pool_sizes(d, m) + patch_free_hook(d, m) + patch_save_path_limit(d, m)      # MH_EXECUTE
     else: log += patch_steam_signin(d, m)
     log += dedupe_dylibs(d, m)          # it moves load commands, so m["cmds"] offsets are stale afterwards
     if GAME_FOLDER and m["ftype"] == 2: log += make_loadable(d, parse(d))
@@ -384,6 +384,42 @@ def patch_watchdog(d, m):
 
 FREE_ENTRY = 0x100012cac        # the engine allocator's core Free(allocator, Block&) (all PoolStorageProxy::Free go through it)
 FREE_PROLOGUE = (0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd, 0xaa0103f3, 0xaa0003f4)   # stp;stp;stp;add x29;mov x19,x1;mov x20,x0
+
+def patch_save_path_limit(d, m):
+    """The game lists its saves folder and drops every slot whose folder path is over 200 characters before reading
+    it:   bl <length> ; cmp w0,#200 ; b.hi <next slot>   (a few instructions before it looks for "metadata.*.json").
+    On a Mac the path is ~100 characters; inside LiveContainer it is ~220, so the Load menu stayed empty and every
+    new save went to ManualSave-0. The b.hi becomes a nop. Same as patchSavePathLimit in MachORetarget.swift."""
+    secs = {}
+    for cmd, off, sz in m["cmds"]:
+        if cmd != LC_SEGMENT_64: continue
+        for i in range(struct.unpack_from("<I", d, off + 64)[0]):
+            so = off + 72 + 80 * i
+            secs[cstr(d[so:so + 16])] = struct.unpack_from("<QQI", d, so + 32)
+    if "__text" not in secs or "__cstring" not in secs: return ["save path patch: sections missing; not applied"]
+    caddr, csize, cfoff = secs["__cstring"]
+    j = d.find(b"metadata.*.json\0", cfoff, cfoff + csize)
+    if j < 0: return ["save path patch: save scan not found; not applied"]
+    target = caddr + j - cfoff
+    addr, size, foff = secs["__text"]; sites = set()
+    for i in range(foff, foff + size - 8, 4):
+        adrp = struct.unpack_from("<I", d, i)[0]
+        if adrp & 0x9f000000 != 0x90000000: continue
+        add = struct.unpack_from("<I", d, i + 4)[0]
+        if add & 0xffc00000 != 0x91000000 or (add >> 5) & 31 != adrp & 31: continue
+        pc = addr + i - foff
+        imm = ((adrp >> 29) & 3) | (((adrp >> 5) & 0x7ffff) << 2); imm -= (1 << 21) if imm & (1 << 20) else 0
+        if (pc & ~0xfff) + (imm << 12) + ((add >> 10) & 0xfff) != target: continue
+        k = i - 4
+        while k > max(foff, i - 0x400):
+            if struct.unpack_from("<I", d, k)[0] == 0x7103201f and struct.unpack_from("<I", d, k + 4)[0] & 0xff00001f == 0x54000008:
+                sites.add(k + 4); break                                     # cmp w0,#200 ; b.hi
+            k -= 4
+    if len(sites) != 1: return ["save path patch: expected 1 site, found %d; NOT applied" % len(sites)]
+    at = sites.pop()
+    struct.pack_into("<I", d, at, 0xd503201f)
+    return ["save path patch: saves in folders with paths over 200 characters are listed (b.hi -> nop at %s)" % hex(addr + at - foff)]
+
 
 def patch_free_hook(d, m):
     """Use-after-free writes in the engine corrupt memory a few seconds after the main menu loads (freed blocks are

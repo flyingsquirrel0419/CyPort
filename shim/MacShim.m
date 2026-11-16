@@ -6239,7 +6239,7 @@ static uint64_t MSUleb(const uint8_t **p, const uint8_t *end) {
 }
 static void MSSaveCodeDump(const struct mach_header *mh0, intptr_t slide) {
     Dl_info di; if (!dladdr(mh0, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
-    if ([MSConfig()[@"SaveCodeDump"] isEqual:@NO]) return;
+    if (![MSConfig()[@"SaveCodeDump"] boolValue]) return;                 /* only when asked (SaveCodeDump = YES) */
     const struct mach_header_64 *mh = (const void *)mh0;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         const struct load_command *lc = (const void *)(mh + 1);
