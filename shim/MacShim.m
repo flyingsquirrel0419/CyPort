@@ -4219,7 +4219,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 @interface MSPadView : UIView @end
 @implementation MSPadView {
     NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link; CGSize _laidOut;
-    UITouch *_moveTouch, *_lookTouch; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
+    UITouch *_moveTouch, *_lookTouch; NSMutableArray<UITouch *> *_lookOld; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
     CAShapeLayer *_stickBase, *_stickKnob; float _lookSpeed;
     CGPoint _lHome, _rHome; UITouch *_rTouch; CAShapeLayer *_rBase, *_rKnob; int _wasd;
     double _stickT0; CGPoint _stickP0; CGFloat _stickMax; int _lookMouse;
@@ -4249,6 +4249,10 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 }
 /* camera stick (MSLookMode 2): centred where the thumb landed; past the edge the centre comes along, so turning back
    answers at once. Small dead zone, full tilt at 80% of the radius; Look sensitivity shortens the throw. */
+- (void)msLookTake:(UITouch *)t at:(CGPoint)p {            /* this finger drives the camera from here on */
+    _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0;
+    if (MSLookMode() == 2 && g_pad) { _lookC = p; _rBase.opacity = _rKnob.opacity = 1; [self msLookStick:p]; }
+}
 - (void)msLookStick:(CGPoint)p {
     CGFloat R = 60, dx = p.x - _lookC.x, dy = p.y - _lookC.y, d = hypot(dx, dy);
     if (d > R) { _lookC.x = p.x - dx * R / d; _lookC.y = p.y - dy * R / d; dx = p.x - _lookC.x; dy = p.y - _lookC.y; d = R; }
@@ -4267,6 +4271,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     id ls = MSConfig()[@"LookSpeed"]; _lookSpeed = ls ? [ls floatValue] : 1; if (_lookSpeed <= 0) _lookSpeed = 1;
     _ctls = [NSMutableArray array];
     _faceOf = [NSMapTable strongToStrongObjectsMapTable];
+    _lookOld = [NSMutableArray array];
     _tap = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     { id v = MSConfig()[@"TouchHaptics"]; _tapOn = [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortTouchHaptics", 1) != 0; }
     GCExtendedGamepad *g = g_pad;
@@ -4381,7 +4386,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
         [self msPlace:c];
     }
     [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR];
-    _rBase.hidden = _rKnob.hidden = YES;
+    if (!(_lookTouch && MSLookMode() == 2 && g_pad)) _rBase.hidden = _rKnob.hidden = YES;   /* re-laid out mid-swipe: keep the camera stick */
     [CATransaction commit];
 }
 - (void)msPlace:(MSCtl *)c {
@@ -4492,6 +4497,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     for (UITouch *t in @[ _moveTouch ?: NSNull.null, _rTouch ?: NSNull.null, _lookTouch ?: NSNull.null ]) if (t != (id)NSNull.null) [all addObject:t];
     for (MSCtl *c in _ctls) if (c.touch) [all addObject:c.touch];
     for (UITouch *t in _faceOf) [all addObject:t];
+    [_lookOld removeAllObjects];
     if (all.count) [self touchesEnded:all withEvent:nil];
     for (MSCtl *c in _ctls) if (c.touch) [self msRelease:c];
     _moveTouch = _rTouch = _lookTouch = nil;
@@ -4501,6 +4507,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     for (UITouch *t in @[ _moveTouch ?: NSNull.null, _rTouch ?: NSNull.null, _lookTouch ?: NSNull.null ]) if (t != (id)NSNull.null && MSTouchGone(t)) [gone addObject:t];
     for (MSCtl *c in _ctls) if (c.touch && MSTouchGone(c.touch)) [gone addObject:c.touch];
     for (UITouch *t in _faceOf) if (MSTouchGone(t)) [gone addObject:t];
+    for (UITouch *t in [_lookOld copy]) if (MSTouchGone(t)) [_lookOld removeObject:t];
     if (!gone.count) return;
     static int n; if (n++ < 5) MSLogf(@"touch pad: %lu finger(s) whose lift never arrived let go", (unsigned long)gone.count);
     [self touchesEnded:gone withEvent:nil];
@@ -4533,10 +4540,11 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
             [CATransaction commit];
             [self msLeftStick:p];
         } else {
-            /* a new camera finger while one is still held: two thumbs can't both be on the camera, so the old touch is
-               one whose lift UIKit never delivered (a system gesture took it) - it used to block the camera until
-               another touch ended. The newest finger takes over. */
-            if (_lookTouch) { static int n; if (n++ < 5) MSLogf(@"touch pad: camera finger replaced (the previous one's lift never arrived)"); }
+            /* a second camera finger while one is held: the newest one drives the camera (the old one may be a touch
+               whose lift never arrived - it used to block the camera), but the old one is kept: when the new one lifts
+               (a tap that just missed a button), the thumb still on the screen takes the camera back instead of the
+               stick vanishing under it (test.11) */
+            if (_lookTouch) { [_lookOld removeObject:_lookTouch]; [_lookOld addObject:_lookTouch]; if (_lookOld.count > 4) [_lookOld removeObjectAtIndex:0]; }
             _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0;
             if (MSLookMode() == 2 && g_pad) { _lookC = p; _rBase.opacity = _rKnob.opacity = 1; [self msLookStick:p]; }
         }
@@ -4548,6 +4556,10 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
         CGPoint p = [t locationInView:self];
         if (t == _moveTouch || t == _rTouch) _stickMax = MAX(_stickMax, hypot(p.x - _stickP0.x, p.y - _stickP0.y));
         if ([_faceOf objectForKey:t]) { [self msFaceTouch:t to:[self msInFace:p] || hypot(p.x - _faceC.x, p.y - _faceC.y) < _faceGap + _faceR * 2.2 ? [self msFaceAt:p] : nil]; continue; }
+        if (t != _lookTouch && [_lookOld containsObject:t]) {          /* the held camera thumb moves again: it has the camera */
+            [_lookOld removeObject:t]; if (_lookTouch) [_lookOld addObject:_lookTouch];
+            [self msLookTake:t at:p];
+        }
         if (t == _lookTouch && MSLookMode() == 2 && g_pad) { [self msLookStick:p]; continue; }
         if (t == _moveTouch) [self msLeftStick:p];
         else if (t == _rTouch) [self msRightStick:p];
@@ -4614,8 +4626,11 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
             [CATransaction commit];
         } else if (t == _lookTouch) {
             _lookTouch = nil; _lookX = _lookY = 0; g_lookFingerAt = 0;   /* swipe: the stick eases back in MSLookFlushStick */
-            if (MSLookMode() == 2 && g_pad) { MSPadSetStick(g_pad.rightThumbstick, 0, 0); _rBase.hidden = _rKnob.hidden = YES; }
-        }
+            if (e && t.phase == UITouchPhaseCancelled) { static int n; if (n++ < 10) MSLogf(@"touch pad: camera finger cancelled by the system"); }
+            UITouch *back = nil; while (_lookOld.count && !back) { back = _lookOld.lastObject; [_lookOld removeLastObject]; if (MSTouchGone(back) || [ts containsObject:back]) back = nil; }
+            if (back) [self msLookTake:back at:[back locationInView:self]];   /* another camera finger is still down: it carries on */
+            else if (MSLookMode() == 2 && g_pad) { MSPadSetStick(g_pad.rightThumbstick, 0, 0); _rBase.hidden = _rKnob.hidden = YES; }
+        } else if ([_lookOld containsObject:t]) [_lookOld removeObject:t];
         if ([_faceOf objectForKey:t]) { [self msFaceTouch:t to:nil]; continue; }
         for (MSCtl *c in _ctls) if (c.touch == t) [self msRelease:c];
     }
