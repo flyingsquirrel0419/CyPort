@@ -39,15 +39,31 @@ enum CloudSource: String, CaseIterable, Identifiable {
     func list() async throws -> [CloudFile] {
         switch self { case .gog: return try await GOGCloud.list(); case .steam: return try await SteamCloud.list(); case .epic: return try await EpicCloud.list() }
     }
-    /// sends these save slots (Epic: a new snapshot of all of them)
-    func send(_ slots: [String], cloud: [CloudFile]) async throws {
+    /// sends these save slots (Epic: a new snapshot of all of them); returns the slots that went up
+    func send(_ slots: [String], cloud: [CloudFile]) async throws -> [String] {
         try await GameCloud.backupOnce(self, cloud)
         let files = GameCloud.localFiles().filter { f in slots.contains { f.rel.hasPrefix($0 + "/") } }
         switch self {
         case .gog: for slot in slots { try await GOGCloud.send(files.filter { $0.rel.hasPrefix(slot + "/") }) }
-        case .steam: try await SteamCloud.send(files, cloud: cloud)
+        case .steam:
+            // one slot per upload batch, one after another: all of them in one batch got result 108 (too many
+            // pending) on every try once a few slots were waiting (2026-11-21). Slots that went up count even when a
+            // later one fails; the rest go next time.
+            var sent: [String] = []
+            for (i, slot) in slots.enumerated() {
+                do { try await SteamCloud.send(files.filter { $0.rel.hasPrefix(slot + "/") }, cloud: cloud) }
+                catch {
+                    guard !sent.isEmpty else { throw error }
+                    GameCloud.log("Steam: \(slot): \(error.localizedDescription) - \(slots.count - i) slot(s) left for the next sync")
+                    break
+                }
+                sent.append(slot)
+                GameCloud.log("Steam: sent \(slot) (\(i + 1) of \(slots.count))")
+            }
+            return sent
         case .epic: try await EpicCloud.send()
         }
+        return slots
     }
 
     static let key = "CyPortCloudSource"
@@ -252,7 +268,7 @@ enum GameCloud {
         }
         if !push.isEmpty {
             progress("Sending \(push.count) save\(push.count == 1 ? "" : "s") to \(source.rawValue)…")
-            try await source.send(push.sorted(), cloud: cloud)
+            push = try await source.send(push.sorted(), cloud: cloud)
             r.sent = push.count
             // the cloud's own times for what was just sent
             let after = slotTimes(try await source.list(), rel: { $0.rel }, date: { $0.modified })
@@ -602,9 +618,15 @@ enum SteamCloud {
         let batch: UInt64
         do { batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0 }
         catch let e as SteamResult where e.code == 108 {
-            GameCloud.log("Steam: too many uploads pending (108) - waiting for Steam to drop them, then trying again")
-            try await Task.sleep(nanoseconds: 20_000_000_000)
-            batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0
+            // Steam still counts earlier uploads as pending: wait a little longer each time (10, 20, 40 s)
+            var got: UInt64? = nil, wait: UInt64 = 10
+            while got == nil {
+                GameCloud.log("Steam: too many uploads pending (108) - waiting \(wait) s for Steam to drop them, then trying again")
+                try await Task.sleep(nanoseconds: wait * 1_000_000_000)
+                do { got = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0 }
+                catch let e as SteamResult where e.code == 108 && wait < 40 { wait *= 2 }
+            }
+            batch = got!
         }
         UserDefaults.standard.set(String(batch), forKey: openKey)
         func complete(_ ok: Bool) async {
