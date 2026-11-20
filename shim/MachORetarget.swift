@@ -21,7 +21,7 @@ enum MachORetarget {
     static let dylibCmds: Set<UInt32> = [LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD]
     static let reroute: Set<String> = [
         "__NSGetExecutablePath", "_sysctlbyname", "_mmap", "_munmap", "_madvise", "_mprotect",
-        "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open",
+        "_opendir", "_realpath$DARWIN_EXTSN", "_stat", "_access", "_fopen", "_open", "_rename", "_mkdir",
         "_read", "_close", "_lseek", "_AUGraphStart", "_AUGraphSetNodeInputCallback", "_sysconf", "_sysctl", "_dlopen",
         "_BinkOpenWithOptions", "_BinkStartAsyncThread", "_BinkDoFrameAsyncMulti", "_BinkDoFrameAsyncWait",
         "_BinkRegisterFrameBuffers", "_BinkGetFrameBuffersInfo", "_pthread_set_qos_class_self_np",
@@ -71,7 +71,8 @@ enum MachORetarget {
         log += rerouteImports(&d, m)
         if m.ftype == 2 {
             log += patchPoolEnd(&d, m); log += patchWatchdog(&d, m); log += patchPoolSizes(&d, gb: poolGB); log += patchFreeHook(&d, m)
-        }
+            log += patchSavePathLimit(&d, m)
+        } else { log += patchSteamSignIn(&d, m) }
         log += try dedupeDylibs(&d, m)
         if m.ftype == 2 { log += makeLoadable(&d, try parse(d)) }
         if m.ftype != 2 { log += try addRpath(&d, "@loader_path") }
@@ -170,6 +171,36 @@ enum MachORetarget {
             }
         }
         return out
+    }
+
+    /// libGameServicesSteam (Steam Mac build): with no Steam client SteamAPI_Init fails, Initialize answers -1 and SignIn
+    /// calls back "not signed in" - and the game then lists no saves (its saves folder is read but every slot dropped;
+    /// new saves always go to ManualSave-0). Like the GOG build's fake sign-in, SignIn now calls back "signed in" at
+    /// once and Initialize answers ok. Every other function there checks Steam itself (its initialized flag / null
+    /// interfaces), so nothing else reaches the missing Steam. Same as patch_steam_signin in ios_retarget.py.
+    static func patchSteamSignIn(_ d: inout [UInt8], _ m: Header) -> [String] {
+        var syms: [String: UInt64] = [:], steam = false, text: (UInt64, UInt64)?
+        for c in m.cmds {
+            if c.cmd == LC_SEGMENT_64 && cstr(d, c.off + 8, c.off + 24) == "__TEXT" { text = (u64(d, c.off + 24), u64(d, c.off + 40)) }
+            if c.cmd == LC_SYMTAB {
+                let symoff = Int(u32(d, c.off + 8)), nsyms = Int(u32(d, c.off + 12)), stroff = Int(u32(d, c.off + 16))
+                for i in 0..<nsyms {
+                    let e = symoff + 16 * i, strx = stroff + Int(u32(d, e)), typ = d[e + 4]
+                    let name = cstr(d, strx, min(strx + 128, d.count))
+                    if name.contains("GameServicesSteam6SignIn") { steam = true }
+                    if typ & 0x0f == 0x0f && (name == "_SignIn" || name == "_Initialize") { syms[name] = u64(d, e + 8) }
+                }
+            }
+        }
+        guard steam else { return [] }
+        guard let text, let si = syms["_SignIn"], let ii = syms["_Initialize"] else { return ["steam sign-in patch: symbols missing; NOT applied"] }
+        let s = Int(text.1 + si - text.0), i = Int(text.1 + ii - text.0)
+        guard s + 12 <= d.count, i + 0x1c <= d.count, u32(d, s) == 0xaa0103e2, u32(d, s + 4) == 0xaa0003e1, u32(d, i + 0x18) == 0x51000400 else {
+            return ["steam sign-in patch: unexpected code; NOT applied"]
+        }
+        put32(&d, s, 0xaa0003e2); put32(&d, s + 4, 0x52800020); put32(&d, s + 8, 0xd61f0040)     // mov x2,x0 ; mov w0,#1 ; br x2
+        put32(&d, i + 0x18, 0x52800000)                                                         // mov w0,#0
+        return ["steam sign-in patch: SignIn answers signed in, Initialize answers ok (no Steam client on iOS)"]
     }
 
     static func addRpath(_ d: inout [UInt8], _ path: String) throws -> [String] {
@@ -378,6 +409,42 @@ enum MachORetarget {
         let (at, rel) = sites[0]
         put32(&d, at, 0x14000000 | (UInt32(truncatingIfNeeded: rel) & 0x3ffffff))
         return ["watchdog patch: engine watchdog timeout skipped at 0x" + String(addr + UInt64(at - foff), radix: 16)]
+    }
+
+    /// The game lists its saves folder and drops every slot whose folder path is over 200 characters before reading
+    /// it:   bl <length> ; cmp w0,#200 ; b.hi <next slot>   (a few instructions before it looks for "metadata.*.json").
+    /// On a Mac the path is ~100 characters; inside LiveContainer it is ~220 (the game's data folder sits inside the
+    /// host app's), so the Load menu stayed empty and every new save went to ManualSave-0. The b.hi becomes a nop.
+    /// Same as patch_save_path_limit in ios_retarget.py.
+    static func patchSavePathLimit(_ d: inout [UInt8], _ m: Header) -> [String] {
+        let secs = sections(d, m)
+        guard let text = secs["__text"], let cs = secs["__cstring"] else { return ["save path patch: sections missing; not applied"] }
+        let (caddr, csize, cfoff) = cs
+        guard let j = find(d, Array("metadata.*.json".utf8) + [0], from: cfoff, to: cfoff + Int(csize)) else {
+            return ["save path patch: save scan not found; not applied"]
+        }
+        let target = Int64(caddr) + Int64(j - cfoff)
+        let (addr, size, foff) = text
+        var sites: Set<Int> = []
+        var i = foff
+        while i < foff + Int(size) - 8 {
+            defer { i += 4 }
+            let adrp = u32(d, i)
+            if adrp & 0x9f000000 != 0x90000000 { continue }
+            let add = u32(d, i + 4)
+            if add & 0xffc00000 != 0x91000000 || (add >> 5) & 31 != adrp & 31 { continue }
+            let pc = Int64(addr) + Int64(i - foff)
+            var imm = Int64((adrp >> 29) & 3) | Int64((adrp >> 5) & 0x7ffff) << 2; if imm & (1 << 20) != 0 { imm -= 1 << 21 }
+            if (pc & ~0xfff) + (imm << 12) + Int64((add >> 10) & 0xfff) != target { continue }
+            var k = i - 4
+            while k > max(foff, i - 0x400) {
+                if u32(d, k) == 0x7103201f && u32(d, k + 4) & 0xff00001f == 0x54000008 { sites.insert(k + 4); break }   // cmp w0,#200 ; b.hi
+                k -= 4
+            }
+        }
+        guard sites.count == 1, let at = sites.first else { return ["save path patch: expected 1 site, found \(sites.count); NOT applied"] }
+        put32(&d, at, 0xd503201f)
+        return ["save path patch: saves in folders with paths over 200 characters are listed (b.hi -> nop at 0x" + String(addr + UInt64(at - foff), radix: 16) + ")"]
     }
 
     static func patchFreeHook(_ d: inout [UInt8], _ m: Header) -> [String] {

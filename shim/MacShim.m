@@ -2989,7 +2989,20 @@ static void MSNotePath(const char *fn, const char *path) {
     if ((FAILED) && errno == ENOENT) { char *f = MSCaseFix(path); if (f) { r = CALL_FIXED; free(f); } else errno = ENOENT; } \
     return r;
 DIR *ms_opendir(const char *path) __asm("_opendir");
-DIR *ms_opendir(const char *path) { MS_CASE_RETRY(k_opendir(path), !r, k_opendir(f)) }
+static DIR *ms_opendir2(const char *path) { MS_CASE_RETRY(k_opendir(path), !r, k_opendir(f)) }
+static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err);
+static BOOL MSSavePath(const char *p);
+DIR *ms_opendir(const char *path) {
+    DIR *r = ms_opendir2(path); int e = errno;
+    if (MSSavePath(path)) {                     /* save audit: what the game sees when it lists a save folder */
+        NSArray *items = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(path) error:nil];
+        NSString *names = [[items sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "];
+        if (names.length > 300) names = [[names substringToIndex:300] stringByAppendingString:@"..."];
+        char tag[512]; snprintf(tag, sizeof tag, "list (%lu: %s)", (unsigned long)items.count, names.UTF8String ?: "");
+        MSSaveNote(tag, path, NULL, r ? 0 : -1, e);
+    }
+    errno = e; return r;
+}
 char *ms_realpath(const char *path, char *out) __asm("_realpath$DARWIN_EXTSN");
 static char *ms_realpath2(const char *path, char *out) { MS_CASE_RETRY(k_realpath(path, out), !r, k_realpath(f, out)) }
 char *ms_realpath(const char *path, char *out) {
@@ -2998,11 +3011,23 @@ char *ms_realpath(const char *path, char *out) {
     return r;
 }
 int ms_stat(const char *path, struct stat *st) __asm("_stat");
-int ms_stat(const char *path, struct stat *st) { MS_CASE_RETRY(k_stat(path, st), r != 0, k_stat(f, st)) }
+static int ms_stat2(const char *path, struct stat *st) { MS_CASE_RETRY(k_stat(path, st), r != 0, k_stat(f, st)) }
+int ms_stat(const char *path, struct stat *st) {
+    int r = ms_stat2(path, st), e = errno;
+    if (MSSavePath(path) && (r != 0 || strstr(path, "Save-"))) MSSaveNote("stat", path, NULL, r, e);
+    errno = e; return r;
+}
 int ms_access(const char *path, int m) __asm("_access");
 int ms_access(const char *path, int m) { MS_CASE_RETRY(k_access(path, m), r != 0, k_access(f, m)) }
 FILE *ms_fopen(const char *path, const char *mode) __asm("_fopen");
-FILE *ms_fopen(const char *path, const char *mode) { MS_CASE_RETRY(k_fopen(path, mode), !r, k_fopen(f, mode)) }
+static FILE *ms_fopen2(const char *path, const char *mode) { MS_CASE_RETRY(k_fopen(path, mode), !r, k_fopen(f, mode)) }
+static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err);
+static BOOL MSSavePath(const char *p);
+FILE *ms_fopen(const char *path, const char *mode) {
+    FILE *r = ms_fopen2(path, mode); int e = errno;
+    if (mode && MSSavePath(path)) MSSaveNote(strpbrk(mode, "wa+") ? "fopen write" : "fopen read", path, NULL, r ? 0 : -1, e);
+    errno = e; return r;
+}
 /* ---------------------------------------------------------------- external SSD: survive it dropping off the bus
  * Under load an SSD on the phone's USB-C port can disconnect for a moment (seen: every read on every open file fails
  * with EIO, F_GETPATH fails, and on the next launch the bookmark doesn't resolve until it remounts). The engine treats
@@ -3133,6 +3158,36 @@ static BOOL MSReopenFd(int fd, off_t off) {
     return NO;
 }
 
+/* save audit: every write the game makes where its saves go ("save" in the path) - opened or not (errno), renamed or
+   not - and the free space at the first one, so a save that "didn't happen" shows in macshim.log as either no write at
+   all, a failed one, or one that went somewhere unexpected */
+static BOOL MSSavePath(const char *p) { return p && strcasestr(p, "save") && !strcasestr(p, "saves-backup"); }
+static void MSSaveNote(const char *what, const char *path, const char *to, int r, int err) {
+    static _Atomic int n; if (n++ >= 600) return;
+    static dispatch_once_t once; dispatch_once(&once, ^{
+        NSString *as = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+        NSDictionary *a = [NSFileManager.defaultManager attributesOfFileSystemForPath:as error:nil];
+        NSNumber *imp = [[NSURL fileURLWithPath:as] resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey] error:nil][NSURLVolumeAvailableCapacityForImportantUsageKey];
+        MSLogf(@"save: free space %.2f GB (%.2f GB counting purgeable), saves folder %@", [a[NSFileSystemFreeSize] doubleValue] / 1e9, imp.doubleValue / 1e9, as);
+    });
+    if (r < 0) MSLogf(@"save: %s FAILED (%s): %s%s%s", what, strerror(err), path, to ? " -> " : "", to ?: "");
+    else MSLogf(@"save: %s ok: %s%s%s", what, path, to ? " -> " : "", to ?: "");
+}
+int ms_rename(const char *from, const char *to) __asm("_rename");
+int ms_rename(const char *from, const char *to) {
+    static int (*real)(const char *, const char *); if (!real) real = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "rename");
+    int r = real(from, to), e = errno;
+    if (MSSavePath(from) || MSSavePath(to)) MSSaveNote("rename", from, to, r, e);
+    errno = e; return r;
+}
+int ms_mkdir(const char *path, mode_t m) __asm("_mkdir");
+int ms_mkdir(const char *path, mode_t m) {
+    static int (*real)(const char *, mode_t); if (!real) real = (int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "mkdir");
+    int r = real(path, m), e = errno;
+    if (MSSavePath(path) && !(r < 0 && e == EEXIST)) MSSaveNote("mkdir", path, NULL, r, e);
+    errno = e; return r;
+}
+
 int ms_open(const char *path, int flags, ...) __asm("_open");
 int ms_open(const char *path, int flags, ...) {
     MSIOSyms();
@@ -3148,6 +3203,15 @@ int ms_open(const char *path, int flags, ...) {
         int e = errno; if (MSWaitForDrive("open")) fd = MSOpenCase(path, flags, mode); else errno = e;
     }
     if (fd >= 0) MSTrackFd(fd, path);
+    if (MSSavePath(path)) {
+        int e = errno;
+        if (flags & (O_WRONLY | O_RDWR | O_CREAT)) MSSaveNote("write", path, NULL, fd, e);
+        else {                                  /* save audit: the game reading a save (its metadata decides the list) */
+            struct stat st; char tag[64]; snprintf(tag, sizeof tag, "read (%lld bytes)", fd >= 0 && fstat(fd, &st) == 0 ? (long long)st.st_size : -1LL);
+            MSSaveNote(tag, path, NULL, fd, e);
+        }
+        errno = e;
+    }
     return fd;
 }
 int ms_close(int fd) __asm("_close");
@@ -4155,7 +4219,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 @interface MSPadView : UIView @end
 @implementation MSPadView {
     NSMutableArray<MSCtl *> *_ctls; BOOL _hiddenByUser, _shown; CADisplayLink *_link; CGSize _laidOut;
-    UITouch *_moveTouch, *_lookTouch; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
+    UITouch *_moveTouch, *_lookTouch; NSMutableArray<UITouch *> *_lookOld; CGPoint _moveOrigin, _lookLast; CGVector _lookAccum; double _lookT, _lookMoved; float _lookX, _lookY;
     CAShapeLayer *_stickBase, *_stickKnob; float _lookSpeed;
     CGPoint _lHome, _rHome; UITouch *_rTouch; CAShapeLayer *_rBase, *_rKnob; int _wasd;
     double _stickT0; CGPoint _stickP0; CGFloat _stickMax; int _lookMouse;
@@ -4185,6 +4249,10 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
 }
 /* camera stick (MSLookMode 2): centred where the thumb landed; past the edge the centre comes along, so turning back
    answers at once. Small dead zone, full tilt at 80% of the radius; Look sensitivity shortens the throw. */
+- (void)msLookTake:(UITouch *)t at:(CGPoint)p {            /* this finger drives the camera from here on */
+    _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0;
+    if (MSLookMode() == 2 && g_pad) { _lookC = p; _rBase.opacity = _rKnob.opacity = 1; [self msLookStick:p]; }
+}
 - (void)msLookStick:(CGPoint)p {
     CGFloat R = 60, dx = p.x - _lookC.x, dy = p.y - _lookC.y, d = hypot(dx, dy);
     if (d > R) { _lookC.x = p.x - dx * R / d; _lookC.y = p.y - dy * R / d; dx = p.x - _lookC.x; dy = p.y - _lookC.y; d = R; }
@@ -4203,6 +4271,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     id ls = MSConfig()[@"LookSpeed"]; _lookSpeed = ls ? [ls floatValue] : 1; if (_lookSpeed <= 0) _lookSpeed = 1;
     _ctls = [NSMutableArray array];
     _faceOf = [NSMapTable strongToStrongObjectsMapTable];
+    _lookOld = [NSMutableArray array];
     _tap = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     { id v = MSConfig()[@"TouchHaptics"]; _tapOn = [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : MSPref(@"CyPortTouchHaptics", 1) != 0; }
     GCExtendedGamepad *g = g_pad;
@@ -4317,7 +4386,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
         [self msPlace:c];
     }
     [self msDrawStick:_stickBase knob:_stickKnob at:_lHome offset:CGPointZero r:g_stickR];
-    _rBase.hidden = _rKnob.hidden = YES;
+    if (!(_lookTouch && MSLookMode() == 2 && g_pad)) _rBase.hidden = _rKnob.hidden = YES;   /* re-laid out mid-swipe: keep the camera stick */
     [CATransaction commit];
 }
 - (void)msPlace:(MSCtl *)c {
@@ -4428,6 +4497,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     for (UITouch *t in @[ _moveTouch ?: NSNull.null, _rTouch ?: NSNull.null, _lookTouch ?: NSNull.null ]) if (t != (id)NSNull.null) [all addObject:t];
     for (MSCtl *c in _ctls) if (c.touch) [all addObject:c.touch];
     for (UITouch *t in _faceOf) [all addObject:t];
+    [_lookOld removeAllObjects];
     if (all.count) [self touchesEnded:all withEvent:nil];
     for (MSCtl *c in _ctls) if (c.touch) [self msRelease:c];
     _moveTouch = _rTouch = _lookTouch = nil;
@@ -4437,6 +4507,7 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
     for (UITouch *t in @[ _moveTouch ?: NSNull.null, _rTouch ?: NSNull.null, _lookTouch ?: NSNull.null ]) if (t != (id)NSNull.null && MSTouchGone(t)) [gone addObject:t];
     for (MSCtl *c in _ctls) if (c.touch && MSTouchGone(c.touch)) [gone addObject:c.touch];
     for (UITouch *t in _faceOf) if (MSTouchGone(t)) [gone addObject:t];
+    for (UITouch *t in [_lookOld copy]) if (MSTouchGone(t)) [_lookOld removeObject:t];
     if (!gone.count) return;
     static int n; if (n++ < 5) MSLogf(@"touch pad: %lu finger(s) whose lift never arrived let go", (unsigned long)gone.count);
     [self touchesEnded:gone withEvent:nil];
@@ -4459,15 +4530,21 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
             [self msPaint:c]; [self msFeel]; continue;
         }
         if (!_rTouch && [self msNear:p to:_rHome r:80]) { _rTouch = t; _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0; [self msRightStick:p]; continue; }
-        if (p.x < self.bounds.size.width * 0.45) {
-            if (_moveTouch) continue;
+        /* left part of the screen: the move stick - unless the left thumb is already on it, then this finger is the
+           camera (a right thumb landing just left of the middle used to be ignored: "the camera sometimes doesn't move") */
+        if (p.x < self.bounds.size.width * 0.45 && !_moveTouch) {
             _moveTouch = t; _moveOrigin = [self msNear:p to:_lHome r:85] ? _lHome : p;   /* on the stick: centred; elsewhere: it follows the thumb */
             _stickT0 = t.timestamp; _stickP0 = p; _stickMax = 0;
             [CATransaction begin]; [CATransaction setDisableActions:YES];
             [self msDrawStick:_stickBase knob:_stickKnob at:_moveOrigin offset:CGPointZero r:g_stickR];
             [CATransaction commit];
             [self msLeftStick:p];
-        } else if (!_lookTouch) {
+        } else {
+            /* a second camera finger while one is held: the newest one drives the camera (the old one may be a touch
+               whose lift never arrived - it used to block the camera), but the old one is kept: when the new one lifts
+               (a tap that just missed a button), the thumb still on the screen takes the camera back instead of the
+               stick vanishing under it (test.11) */
+            if (_lookTouch) { [_lookOld removeObject:_lookTouch]; [_lookOld addObject:_lookTouch]; if (_lookOld.count > 4) [_lookOld removeObjectAtIndex:0]; }
             _lookTouch = t; _lookLast = p; _lookT = t.timestamp; _lookX = _lookY = 0;
             if (MSLookMode() == 2 && g_pad) { _lookC = p; _rBase.opacity = _rKnob.opacity = 1; [self msLookStick:p]; }
         }
@@ -4479,6 +4556,10 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
         CGPoint p = [t locationInView:self];
         if (t == _moveTouch || t == _rTouch) _stickMax = MAX(_stickMax, hypot(p.x - _stickP0.x, p.y - _stickP0.y));
         if ([_faceOf objectForKey:t]) { [self msFaceTouch:t to:[self msInFace:p] || hypot(p.x - _faceC.x, p.y - _faceC.y) < _faceGap + _faceR * 2.2 ? [self msFaceAt:p] : nil]; continue; }
+        if (t != _lookTouch && [_lookOld containsObject:t]) {          /* the held camera thumb moves again: it has the camera */
+            [_lookOld removeObject:t]; if (_lookTouch) [_lookOld addObject:_lookTouch];
+            [self msLookTake:t at:p];
+        }
         if (t == _lookTouch && MSLookMode() == 2 && g_pad) { [self msLookStick:p]; continue; }
         if (t == _moveTouch) [self msLeftStick:p];
         else if (t == _rTouch) [self msRightStick:p];
@@ -4545,8 +4626,11 @@ typedef enum { MSCtlButton, MSCtlToggle, MSCtlEdit, MSCtlTool } MSCtlKind;   /* 
             [CATransaction commit];
         } else if (t == _lookTouch) {
             _lookTouch = nil; _lookX = _lookY = 0; g_lookFingerAt = 0;   /* swipe: the stick eases back in MSLookFlushStick */
-            if (MSLookMode() == 2 && g_pad) { MSPadSetStick(g_pad.rightThumbstick, 0, 0); _rBase.hidden = _rKnob.hidden = YES; }
-        }
+            if (e && t.phase == UITouchPhaseCancelled) { static int n; if (n++ < 10) MSLogf(@"touch pad: camera finger cancelled by the system"); }
+            UITouch *back = nil; while (_lookOld.count && !back) { back = _lookOld.lastObject; [_lookOld removeLastObject]; if (MSTouchGone(back) || [ts containsObject:back]) back = nil; }
+            if (back) [self msLookTake:back at:[back locationInView:self]];   /* another camera finger is still down: it carries on */
+            else if (MSLookMode() == 2 && g_pad) { MSPadSetStick(g_pad.rightThumbstick, 0, 0); _rBase.hidden = _rKnob.hidden = YES; }
+        } else if ([_lookOld containsObject:t]) [_lookOld removeObject:t];
         if ([_faceOf objectForKey:t]) { [self msFaceTouch:t to:nil]; continue; }
         for (MSCtl *c in _ctls) if (c.touch == t) [self msRelease:c];
     }
@@ -5041,7 +5125,35 @@ static void ms_drPresent(id self, SEL c) {                      /* -[CAMetalDraw
     if (T > 0 || U > 0) ((void (*)(id, SEL, CFTimeInterval))(g_oDrPresentMin ?: class_getMethodImplementation(object_getClass(self), @selector(presentAfterMinimumDuration:))))(self, @selector(presentAfterMinimumDuration:), T > 0 ? T - 0.002 : MSCapMargin(U));
     else ((void (*)(id, SEL))g_oDrPresent)(self, c);
 }
+/* Going to the background: GPU work the game still had queued fails with "not permitted" (iOS doesn't let a background
+   app use the GPU), and the game treats any failed command buffer as fatal - the crash in a Metal completion handler
+   every time the app was left. Such a buffer reports success instead (its picture is never shown anyway). */
+static IMP g_oCBStatus, g_oCBError;
+static BOOL MSBgGPUError(id cb) {
+    NSError *e = ((NSError *(*)(id, SEL))g_oCBError)(cb, @selector(error));
+    return e && [e.domain isEqualToString:MTLCommandBufferErrorDomain] && (e.code == MTLCommandBufferErrorNotPermitted || (g_inBackground && e.code != MTLCommandBufferErrorOutOfMemory));
+}
+static MTLCommandBufferStatus ms_cbStatus(id self, SEL c) {
+    MTLCommandBufferStatus st = ((MTLCommandBufferStatus (*)(id, SEL))g_oCBStatus)(self, c);
+    if (st == MTLCommandBufferStatusError && MSBgGPUError(self)) {
+        static _Atomic int n; if (n++ < 5) MSLogf(@"background: GPU work refused by iOS (%@) - reported as done", ((NSError *(*)(id, SEL))g_oCBError)(self, @selector(error)).localizedDescription);
+        return MTLCommandBufferStatusCompleted;
+    }
+    return st;
+}
+static NSError *ms_cbError(id self, SEL c) {
+    NSError *e = ((NSError *(*)(id, SEL))g_oCBError)(self, c);
+    return e && MSBgGPUError(self) ? nil : e;
+}
+static void MSInstallBgGPU(id<MTLCommandBuffer> cb) {
+    if ([MSConfig()[@"BackgroundGPUMask"] isEqual:@NO] || !cb || g_oCBStatus) return;
+    Method ms = class_getInstanceMethod(object_getClass(cb), @selector(status)), me = class_getInstanceMethod(object_getClass(cb), @selector(error));
+    if (!ms || !me) return;
+    g_oCBError = method_getImplementation(me); g_oCBStatus = method_setImplementation(ms, (IMP)ms_cbStatus);
+    method_setImplementation(me, (IMP)ms_cbError);
+}
 static void MSInstallPacing(void) {
+    { id<MTLDevice> d = MTLCreateSystemDefaultDevice(); MSInstallBgGPU([[d newCommandQueue] commandBuffer]); }
     if ([MSConfig()[@"FramePacing"] isEqual:@NO]) { MSLogf(@"frame pacing: off (FramePacing = NO)"); return; }
     Method m = class_getInstanceMethod(CAMetalLayer.class, @selector(nextDrawable));
     if (m && !g_origNextDrawable) g_origNextDrawable = method_setImplementation(m, (IMP)ms_nextDrawable);
@@ -5899,6 +6011,358 @@ static void MSPatchGalaxy(const struct mach_header *mh, intptr_t slide) {
     }
 }
 __attribute__((constructor)) static void MSInstallGalaxyPatch(void) { _dyld_register_func_for_add_image(MSPatchGalaxy); }
+
+/* ---------------------------------------------------------------- Steam game services: what they use (diagnostic)
+   With no Steam client on iOS, SteamAPI_Init fails and the Steam build's game services show no saves. To fake a
+   signed-in Steam user, the exact Steam calls libGameServicesSteam makes are needed: this logs its imports from
+   libsteam_api, its own exported functions, and what the game program imports from it. */
+#include <mach-o/nlist.h>
+static void MSDumpSymbols(const struct mach_header_64 *mh, intptr_t slide, const char *tag, const char *fromLib, BOOL exports) {
+    const struct load_command *lc = (const void *)(mh + 1);
+    const struct symtab_command *st = NULL; const struct segment_command_64 *le = NULL;
+    const char *libs[256] = { 0 }; int nlibs = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_SYMTAB) st = (const void *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT")) le = (const void *)lc;
+        else if ((lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB || lc->cmd == LC_REEXPORT_DYLIB || lc->cmd == LC_LOAD_UPWARD_DYLIB) && nlibs < 255)
+            libs[++nlibs] = (const char *)lc + ((const struct dylib_command *)lc)->dylib.name.offset;
+    }
+    if (!st || !le) { MSLogf(@"steam services: %s has no symbol table", tag); return; }
+    uintptr_t base = le->vmaddr + slide - le->fileoff;
+    const struct nlist_64 *nl = (const void *)(base + st->symoff); const char *strs = (const char *)(base + st->stroff);
+    NSMutableArray *imp = [NSMutableArray array], *exp = [NSMutableArray array];
+    for (uint32_t i = 0; i < st->nsyms; i++) {
+        if (nl[i].n_type & N_STAB) continue;
+        const char *name = strs + nl[i].n_un.n_strx;
+        if ((nl[i].n_type & N_TYPE) == N_UNDF && (nl[i].n_type & N_EXT)) {
+            int ord = GET_LIBRARY_ORDINAL(nl[i].n_desc);
+            if (fromLib && ord > 0 && ord <= nlibs && strstr(libs[ord], fromLib)) [imp addObject:@(name)];
+        } else if (exports && (nl[i].n_type & N_TYPE) == N_SECT && (nl[i].n_type & N_EXT))
+            [exp addObject:[NSString stringWithFormat:@"%s@%llx", name, (unsigned long long)(nl[i].n_value)]];
+    }
+    void (^out)(NSString *, NSArray *) = ^(NSString *what, NSArray *a) {
+        MSLogf(@"steam services: %s %@ (%lu):", tag, what, (unsigned long)a.count);
+        for (NSUInteger k = 0; k < a.count && k < 1500; k += 12)
+            MSLogf(@"steam services:   %@", [[a subarrayWithRange:NSMakeRange(k, MIN(12, a.count - k))] componentsJoinedByString:@" "]);
+    };
+    if (fromLib) out([NSString stringWithFormat:@"imports from %s", fromLib], imp);
+    if (exports) out(@"exports", exp);
+}
+static void MSSteamServicesDump(const struct mach_header *mh, intptr_t slide) {
+    if (![MSConfig()[@"SteamSymbolDump"] boolValue]) return;          /* diagnostic: only with SteamSymbolDump = YES */
+    Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname) return;
+    const char *f = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+    if (!strcmp(f, "libGameServicesSteam.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libsteam_api", YES);
+    else if (!strcmp(f, "CyberpunkGame.dylib")) MSDumpSymbols((const void *)mh, slide, f, "libGameServicesSteam", NO);
+}
+__attribute__((constructor)) static void MSInstallSteamServicesDump(void) { _dyld_register_func_for_add_image(MSSteamServicesDump); }
+
+/* ---------------------------------------------------------------- save audit, part 2 (diagnostic)
+   The Steam build lists the saves folder and each slot's files but never opens a slot's metadata through the calls
+   rerouted at install (open/fopen/stat/access). Whatever else it uses on save paths is caught here: the game
+   program's import slots for these functions are pointed at logging wrappers when it loads. */
+static void *g_rOpenat, *g_rLstat, *g_rFstatat, *g_rGetattrlist, *g_rFaccessat, *g_rUnlink, *g_rRemove, *g_rRmdir, *g_rReaddir, *g_rStat64, *g_rLstat64;
+static void MSSaveNote2(const char *what, const char *path, int r, int err) {
+    if (MSSavePath(path) && !(r < 0 && err == ENOENT && !strstr(path, "Save-"))) MSSaveNote(what, path, NULL, r, err);
+}
+static int w_openat(int fd, const char *p, int fl, int mode) { int r = ((int (*)(int, const char *, int, ...))g_rOpenat)(fd, p, fl, mode), e = errno; MSSaveNote2("openat", p, r, e); errno = e; return r; }
+static int w_lstat(const char *p, struct stat *st) { int r = ((int (*)(const char *, struct stat *))g_rLstat)(p, st), e = errno; MSSaveNote2("lstat", p, r, e); errno = e; return r; }
+static int w_stat64(const char *p, struct stat *st) { int r = ((int (*)(const char *, struct stat *))g_rStat64)(p, st), e = errno; MSSaveNote2("stat64", p, r, e); errno = e; return r; }
+static int w_lstat64(const char *p, struct stat *st) { int r = ((int (*)(const char *, struct stat *))g_rLstat64)(p, st), e = errno; MSSaveNote2("lstat64", p, r, e); errno = e; return r; }
+static int w_fstatat(int fd, const char *p, struct stat *st, int fl) { int r = ((int (*)(int, const char *, struct stat *, int))g_rFstatat)(fd, p, st, fl), e = errno; MSSaveNote2("fstatat", p, r, e); errno = e; return r; }
+static int w_getattrlist(const char *p, void *a, void *b, size_t n, unsigned o) { int r = ((int (*)(const char *, void *, void *, size_t, unsigned))g_rGetattrlist)(p, a, b, n, o), e = errno; MSSaveNote2("getattrlist", p, r, e); errno = e; return r; }
+static int w_faccessat(int fd, const char *p, int m, int fl) { int r = ((int (*)(int, const char *, int, int))g_rFaccessat)(fd, p, m, fl), e = errno; MSSaveNote2("faccessat", p, r, e); errno = e; return r; }
+static int w_unlink(const char *p) { int r = ((int (*)(const char *))g_rUnlink)(p), e = errno; MSSaveNote2("unlink", p, r, e); errno = e; return r; }
+static int w_remove(const char *p) { int r = ((int (*)(const char *))g_rRemove)(p), e = errno; MSSaveNote2("remove", p, r, e); errno = e; return r; }
+static int w_rmdir(const char *p) { int r = ((int (*)(const char *))g_rRmdir)(p), e = errno; MSSaveNote2("rmdir", p, r, e); errno = e; return r; }
+static struct dirent *w_readdir(DIR *d) {
+    struct dirent *r = ((struct dirent *(*)(DIR *))g_rReaddir)(d);
+    static _Atomic int n; if (r && strstr(r->d_name, "Save-") && n++ < 40) MSLogf(@"save: readdir -> %s (type %d)", r->d_name, r->d_type);
+    return r;
+}
+static void MSSaveAudit2(const struct mach_header *mh, intptr_t slide) {
+    Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
+    if (![MSConfig()[@"SaveAudit2"] boolValue]) return;          /* diagnostic: only with SaveAudit2 = YES */
+    struct { const char *name; void **real; void *wrap; } t[] = {
+        { "openat", &g_rOpenat, w_openat }, { "lstat", &g_rLstat, w_lstat }, { "fstatat", &g_rFstatat, w_fstatat },
+        { "getattrlist", &g_rGetattrlist, w_getattrlist }, { "faccessat", &g_rFaccessat, w_faccessat },
+        { "unlink", &g_rUnlink, w_unlink }, { "remove", &g_rRemove, w_remove }, { "rmdir", &g_rRmdir, w_rmdir },
+        { "readdir", &g_rReaddir, w_readdir }, { "stat64", &g_rStat64, w_stat64 }, { "lstat64", &g_rLstat64, w_lstat64 },
+    };
+    size_t nt = sizeof t / sizeof *t; void *addr[16];
+    for (size_t k = 0; k < nt; k++) { addr[k] = dlsym(RTLD_DEFAULT, t[k].name); *t[k].real = addr[k]; }
+    int hits[16] = { 0 };
+    const char *segs[][2] = { { "__DATA_CONST", "__got" }, { "__DATA", "__got" }, { "__DATA", "__la_symbol_ptr" }, { "__AUTH_CONST", "__auth_got" } };
+    for (size_t g = 0; g < sizeof segs / sizeof *segs; g++) {
+        unsigned long sz = 0; uint8_t *sec = getsectiondata((const struct mach_header_64 *)mh, segs[g][0], segs[g][1], &sz);
+        for (unsigned long o = 0; sec && o + 8 <= sz; o += 8) {
+            void **slot = (void **)(sec + o);
+            for (size_t k = 0; k < nt; k++) {
+                if (!addr[k] || *slot != addr[k]) continue;
+                vm_address_t pg = (vm_address_t)slot & ~(vm_address_t)0x3fff;
+                vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                *slot = t[k].wrap; hits[k]++;
+                vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ);
+            }
+        }
+    }
+    NSMutableArray *a = [NSMutableArray array];
+    for (size_t k = 0; k < nt; k++) [a addObject:[NSString stringWithFormat:@"%s %d", t[k].name, hits[k]]];
+    MSLogf(@"save audit 2: game import slots wrapped: %@", [a componentsJoinedByString:@", "]);
+    MSDumpSymbols((const void *)mh, slide, "CyberpunkGame.dylib", "libSystem", NO);
+    MSDumpSymbols((const void *)mh, slide, "CyberpunkGame.dylib", "libc++", NO);
+    MSDumpSymbols((const void *)mh, slide, "CyberpunkGame.dylib", "Foundation", NO);
+}
+__attribute__((constructor)) static void MSInstallSaveAudit2(void) { _dyld_register_func_for_add_image(MSSaveAudit2); }
+
+/* ---------------------------------------------------------------- save audit, part 3 (diagnostic)
+   Part 2 showed the Steam build lists every slot's files and then touches none of them, with no stat, open, lstat or
+   readdir call failing. What's left: the game asking libGameServicesSteam (found with dlsym) whether saves may be
+   listed, libc++'s own file calls (std::ifstream, std::filesystem) and Foundation's. Each is logged here. */
+static const void *g_gameMH;
+static BOOL MSFromGame(void *ret) { Dl_info d; return g_gameMH && dladdr(ret, &d) && d.dli_fbase == g_gameMH; }
+static int MSWrapSlot(const struct mach_header *mh, void *real, void *wrap) {
+    int hits = 0; if (!real) return 0;
+    const char *segs[][2] = { { "__DATA_CONST", "__got" }, { "__DATA", "__got" }, { "__DATA", "__la_symbol_ptr" }, { "__AUTH_CONST", "__auth_got" } };
+    for (size_t g = 0; g < sizeof segs / sizeof *segs; g++) {
+        unsigned long sz = 0; uint8_t *sec = getsectiondata((const struct mach_header_64 *)mh, segs[g][0], segs[g][1], &sz);
+        for (unsigned long o = 0; sec && o + 8 <= sz; o += 8) {
+            void **slot = (void **)(sec + o); if (*slot != real) continue;
+            vm_address_t pg = (vm_address_t)slot & ~(vm_address_t)0x3fff;
+            vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            *slot = wrap; hits++;
+            vm_protect(mach_task_self(), pg, 0x4000, FALSE, VM_PROT_READ);
+        }
+    }
+    return hits;
+}
+/* the text of a libc++ std::string / std::filesystem::path (either string layout; NULL if it doesn't look like a path) */
+static const char *MSStdStr(const void *s) {
+    const uint8_t *b = s; const char *p;
+    if ((b[0] & 1) && (p = *(const char *const *)(b + 16)) && malloc_size(p) && p[0] == '/') return p;
+    if (!(b[0] & 1) && b[1] == '/') return (const char *)b + 1;
+    if (b[0] == '/') return (const char *)b;
+    if ((b[23] & 0x80) && (p = *(const char *const *)b) && malloc_size(p) && p[0] == '/') return p;
+    return NULL;
+}
+/* GameServices calls the game looks up: logged with their arguments and result (first 12 calls of each) */
+typedef uint64_t (*MSGSFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static const char *g_gsNames[] = { "CheckAdditionalContentStatus", "CloudSaveReady", "DeleteCloudSavedGameData", "FetchCloudSavedGameData",
+    "GetLanguageCodeName", "GetLibraryVersion", "GetPlatformName", "Initialize", "IsInstallThroughAppEnabled", "IsPurchaseThroughAppEnabled",
+    "OpenWebBrowser", "RequestAdditionalContentInstall", "RequestAdditionalContentPurchase", "RequestEncryptedAppTicket", "RequestPlatformToken",
+    "SaveDataToCloud", "SetAddtionalContentInstallCallback", "SetCommandLineHandler", "SetLogger", "SetNetworkState", "SetOverlayHandler",
+    "SetRichPresence", "SignIn", "SyncAchievement", "SyncAchievementList", "Uninitialize", "UnlockAchievement", "VerifyDataIntegrity" };
+#define MS_NGS (sizeof g_gsNames / sizeof *g_gsNames)
+static MSGSFn g_gsReal[MS_NGS]; static _Atomic int g_gsCalls[MS_NGS];
+static uint64_t MSGSCall(int i, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
+    uint64_t r = g_gsReal[i](a, b, c, d, e, f, g, h);
+    int n = g_gsCalls[i]++;
+    if (n < 12) {
+        BOOL str = !strcmp(g_gsNames[i], "GetPlatformName") || !strcmp(g_gsNames[i], "GetLanguageCodeName") || !strcmp(g_gsNames[i], "GetLibraryVersion");
+        MSLogf(@"steam services: game calls %s(%#llx, %#llx, %#llx, %#llx) -> %#llx%s%s%s (call %d)", g_gsNames[i], a, b, c, d, r,
+               str && r > 0x100000000ULL ? " \"" : "", str && r > 0x100000000ULL ? (const char *)r : "", str && r > 0x100000000ULL ? "\"" : "", n + 1);
+    }
+    return r;
+}
+#define GSW(i) static uint64_t gsw##i(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h) { return MSGSCall(i, a, b, c, d, e, f, g, h); }
+GSW(0) GSW(1) GSW(2) GSW(3) GSW(4) GSW(5) GSW(6) GSW(7) GSW(8) GSW(9) GSW(10) GSW(11) GSW(12) GSW(13) GSW(14) GSW(15) GSW(16) GSW(17)
+GSW(18) GSW(19) GSW(20) GSW(21) GSW(22) GSW(23) GSW(24) GSW(25) GSW(26) GSW(27)
+static void *g_gsWrap[] = { gsw0, gsw1, gsw2, gsw3, gsw4, gsw5, gsw6, gsw7, gsw8, gsw9, gsw10, gsw11, gsw12, gsw13, gsw14, gsw15, gsw16, gsw17,
+    gsw18, gsw19, gsw20, gsw21, gsw22, gsw23, gsw24, gsw25, gsw26, gsw27 };
+_Static_assert(sizeof g_gsWrap / sizeof *g_gsWrap == MS_NGS, "one wrapper per GameServices function");
+static void *g_rDlsym;
+static void *w_dlsym(void *h, const char *name) {
+    void *r = ((void *(*)(void *, const char *))g_rDlsym)(h, name);
+    Dl_info d; BOOL gs = r && dladdr(r, &d) && d.dli_fname && strstr(d.dli_fname, "libGameServices");
+    static _Atomic int n; if (gs || n++ < 60) MSLogf(@"steam services: game looks up %s -> %p%s", name ?: "(null)", r, gs ? " (GameServices)" : "");
+    if (gs) for (size_t i = 0; i < MS_NGS; i++) if (!strcmp(name, g_gsNames[i])) { g_gsReal[i] = (MSGSFn)r; return g_gsWrap[i]; }
+    return r;
+}
+/* libc++: std::basic_filebuf::open (std::ifstream / std::ofstream) and std::filesystem::status */
+static void *g_rFbOpen, *g_rFsStatus;
+static void *w_fbopen(void *self, const char *p, unsigned mode) {
+    void *r = ((void *(*)(void *, const char *, unsigned))g_rFbOpen)(self, p, mode); int e = errno;
+    if (MSSavePath(p)) { char tag[64]; snprintf(tag, sizeof tag, "ifstream/ofstream open (mode %#x)", mode); MSSaveNote(tag, p, NULL, r ? 0 : -1, e); }
+    errno = e; return r;
+}
+static uint64_t w_fsstatus(const void *path, void *ec) {
+    uint64_t r = ((uint64_t (*)(const void *, void *))g_rFsStatus)(path, ec); int e = errno;
+    const char *p = MSStdStr(path);
+    if (MSSavePath(p)) { char tag[64]; snprintf(tag, sizeof tag, "std::filesystem::status (type %d)", (int)(int8_t)(r & 0xff)); MSSaveNote(tag, p, NULL, (int8_t)(r & 0xff) > 0 ? 0 : -1, ENOENT); }
+    errno = e; return r;
+}
+/* Foundation, when the game itself asks */
+static IMP g_rFMExists, g_rFMExistsDir, g_rFMAttrs, g_rFMList, g_rFMContents, g_rDataFile, g_rDataFileOpt;
+static BOOL w_fmExists(id s, SEL c, NSString *p) {
+    BOOL r = ((BOOL (*)(id, SEL, NSString *))g_rFMExists)(s, c, p);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager fileExists", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static BOOL w_fmExistsDir(id s, SEL c, NSString *p, BOOL *dir) {
+    BOOL r = ((BOOL (*)(id, SEL, NSString *, BOOL *))g_rFMExistsDir)(s, c, p, dir);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager fileExists:isDirectory", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_fmAttrs(id s, SEL c, NSString *p, NSError **err) {
+    id r = ((id (*)(id, SEL, NSString *, NSError **))g_rFMAttrs)(s, c, p, err);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager attributes", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_fmList(id s, SEL c, NSString *p, NSError **err) {
+    id r = ((id (*)(id, SEL, NSString *, NSError **))g_rFMList)(s, c, p, err);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager list", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_fmContents(id s, SEL c, NSString *p) {
+    id r = ((id (*)(id, SEL, NSString *))g_rFMContents)(s, c, p);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSFileManager contentsAtPath", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_dataFile(id s, SEL c, NSString *p) {
+    id r = ((id (*)(id, SEL, NSString *))g_rDataFile)(s, c, p);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSData contentsOfFile", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static id w_dataFileOpt(id s, SEL c, NSString *p, NSUInteger o, NSError **err) {
+    id r = ((id (*)(id, SEL, NSString *, NSUInteger, NSError **))g_rDataFileOpt)(s, c, p, o, err);
+    if (MSFromGame(__builtin_return_address(0)) && MSSavePath(p.UTF8String)) MSSaveNote("NSData contentsOfFile:options", p.UTF8String, NULL, r ? 0 : -1, ENOENT);
+    return r;
+}
+static void MSSwizzle(Class c, SEL s, IMP w, IMP *old) { Method m = class_getInstanceMethod(c, s); if (m) *old = method_setImplementation(m, w); }
+static void MSSaveAudit3(const struct mach_header *mh, intptr_t slide) {
+    Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
+    if (![MSConfig()[@"SaveAudit3"] boolValue]) return;          /* diagnostic: only with SaveAudit3 = YES */
+    g_gameMH = mh;
+    g_rDlsym = dlsym(RTLD_DEFAULT, "dlsym");
+    g_rFbOpen = dlsym(RTLD_DEFAULT, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj");
+    g_rFsStatus = dlsym(RTLD_DEFAULT, "_ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE");
+    int a = MSWrapSlot(mh, g_rDlsym, w_dlsym), b = MSWrapSlot(mh, g_rFbOpen, w_fbopen), c = MSWrapSlot(mh, g_rFsStatus, w_fsstatus);
+    Class fm = NSFileManager.class, dc = object_getClass(NSData.class);
+    MSSwizzle(fm, @selector(fileExistsAtPath:), (IMP)w_fmExists, &g_rFMExists);
+    MSSwizzle(fm, @selector(fileExistsAtPath:isDirectory:), (IMP)w_fmExistsDir, &g_rFMExistsDir);
+    MSSwizzle(fm, @selector(attributesOfItemAtPath:error:), (IMP)w_fmAttrs, &g_rFMAttrs);
+    MSSwizzle(fm, @selector(contentsOfDirectoryAtPath:error:), (IMP)w_fmList, &g_rFMList);
+    MSSwizzle(fm, @selector(contentsAtPath:), (IMP)w_fmContents, &g_rFMContents);
+    MSSwizzle(dc, @selector(dataWithContentsOfFile:), (IMP)w_dataFile, &g_rDataFile);
+    MSSwizzle(dc, @selector(dataWithContentsOfFile:options:error:), (IMP)w_dataFileOpt, &g_rDataFileOpt);
+    MSLogf(@"save audit 3: game import slots wrapped: dlsym %d, ifstream open %d, filesystem::status %d; NSFileManager/NSData calls from the game logged", a, b, c);
+}
+__attribute__((constructor)) static void MSInstallSaveAudit3(void) { _dyld_register_func_for_add_image(MSSaveAudit3); }
+
+/* ---------------------------------------------------------------- save code dump (diagnostic)
+   The Steam build lists every slot and then drops them without reading a single file; the reason is only in the
+   game's own code. The functions that use the save file names (sav.dat, metadata, ManualSave, ...) are written,
+   compressed, to Documents/save_code_dump.txt, with the strings they use. SaveCodeDump = NO turns it off. */
+#include <mach-o/loader.h>
+static uint64_t MSUleb(const uint8_t **p, const uint8_t *end) {
+    uint64_t v = 0; int s = 0; while (*p < end) { uint8_t b = *(*p)++; v |= (uint64_t)(b & 0x7f) << s; s += 7; if (!(b & 0x80)) break; } return v;
+}
+static void MSSaveCodeDump(const struct mach_header *mh0, intptr_t slide) {
+    Dl_info di; if (!dladdr(mh0, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
+    if (![MSConfig()[@"SaveCodeDump"] boolValue]) return;                 /* only when asked (SaveCodeDump = YES) */
+    const struct mach_header_64 *mh = (const void *)mh0;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        const struct load_command *lc = (const void *)(mh + 1);
+        const struct segment_command_64 *le = NULL, *tx = NULL; const struct linkedit_data_command *fs = NULL; const struct symtab_command *st = NULL;
+        for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+            if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT")) le = (const void *)lc;
+            else if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__TEXT")) tx = (const void *)lc;
+            else if (lc->cmd == LC_FUNCTION_STARTS) fs = (const void *)lc;
+            else if (lc->cmd == LC_SYMTAB) st = (const void *)lc;
+        }
+        unsigned long tsz = 0, csz = 0;
+        const uint8_t *text = getsectiondata(mh, "__TEXT", "__text", &tsz), *cstr = getsectiondata(mh, "__TEXT", "__cstring", &csz);
+        if (!le || !tx || !fs || !text || !cstr) { MSLogf(@"save code dump: game has no %s", !fs ? "function starts" : "text/cstring"); return; }
+        uintptr_t lbase = le->vmaddr + slide - le->fileoff;
+        /* 1. the save strings */
+        const char *keys[] = { "metadata", "sav.dat", "Save-", "ManualSave", "AutoSave", "QuickSave", "PointOfNoReturn", "EndGameSave",
+                               "user.gls", "SaveGame", "savegame", "Savegame", "SaveLoad", "saveLoad", "SaveSystem", "CloudSave", "PlatformToken" };
+        NSMutableIndexSet *hitStr = [NSMutableIndexSet indexSet];            /* offsets in __cstring */
+        for (unsigned long o = 0; o < csz; ) {
+            const char *s = (const char *)cstr + o; size_t n = strnlen(s, csz - o);
+            for (size_t k = 0; k < sizeof keys / sizeof *keys; k++) if (strstr(s, keys[k])) { [hitStr addIndex:o]; break; }
+            o += n + 1;
+        }
+        uint64_t cAddr = (uint64_t)(uintptr_t)cstr, tAddr = (uint64_t)(uintptr_t)text;
+        /* 2. function starts */
+        NSMutableArray<NSNumber *> *starts = [NSMutableArray array];
+        { const uint8_t *p = (const uint8_t *)(lbase + fs->dataoff), *e = p + fs->datasize; uint64_t a = tx->vmaddr + slide;
+          while (p < e) { uint64_t d = MSUleb(&p, e); if (!d) break; a += d; [starts addObject:@(a)]; } }
+        /* 3. code referring to the strings: adrp xN + add xN, xN, #lo within 4 instructions */
+        const uint32_t *ins = (const void *)text; size_t ni = tsz / 4;
+        NSMutableIndexSet *funcs = [NSMutableIndexSet indexSet]; NSMutableDictionary *why = [NSMutableDictionary dictionary];
+        for (size_t i = 0; i < ni; i++) {
+            uint32_t a = ins[i]; if ((a & 0x9f000000) != 0x90000000) continue;
+            uint64_t pc = tAddr + i * 4, rd = a & 31;
+            int64_t imm = ((int64_t)(((a >> 5) & 0x7ffff) << 2 | ((a >> 29) & 3)) << 43) >> 31;
+            uint64_t page = (pc & ~0xfffULL) + imm;
+            if (page + 0x1000 <= cAddr || page >= cAddr + csz) continue;
+            for (size_t j = i + 1; j < ni && j <= i + 4; j++) {
+                uint32_t b = ins[j];
+                if ((b & 0xffc00000) == 0x91000000 && ((b >> 5) & 31) == rd) {
+                    uint64_t tgt = page + ((b >> 10) & 0xfff);
+                    if (tgt >= cAddr && tgt < cAddr + csz && [hitStr containsIndex:(NSUInteger)(tgt - cAddr)]) {
+                        /* containing function: last start <= pc */
+                        NSUInteger lo = 0, hi = starts.count;
+                        while (lo < hi) { NSUInteger m = (lo + hi) / 2; if (starts[m].unsignedLongLongValue <= pc) lo = m + 1; else hi = m; }
+                        if (lo) { [funcs addIndex:lo - 1]; why[@(lo - 1)] = @((const char *)(uintptr_t)tgt); }
+                    }
+                    break;
+                }
+            }
+        }
+        /* 4. write: functions (unslid address, bytes) + every string they refer to */
+        NSMutableData *blob = [NSMutableData data]; NSMutableString *idx = [NSMutableString string];
+        __block NSUInteger nf = 0, total = 0;
+        [funcs enumerateIndexesUsingBlock:^(NSUInteger k, BOOL *stop) {
+            uint64_t s = starts[k].unsignedLongLongValue, e = k + 1 < starts.count ? starts[k + 1].unsignedLongLongValue : tAddr + tsz;
+            uint64_t len = MIN(e - s, 0x4000ULL);
+            if (total + len > 0x40000 || nf >= 80) { *stop = YES; return; }
+            [idx appendFormat:@"F %llx %llx %@\n", s - slide, len, [[why[@(k)] description] stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]];
+            [blob appendBytes:(const void *)(uintptr_t)s length:(NSUInteger)len]; total += len; nf++;
+            MSLogf(@"save code dump: function %llx, %llu bytes, uses \"%@\"", s - slide, len, why[@(k)]);
+            /* strings used inside */
+            const uint32_t *f = (const void *)(uintptr_t)s;
+            for (uint64_t i = 0; i + 1 < len / 4; i++) {
+                uint32_t a = f[i]; if ((a & 0x9f000000) != 0x90000000) continue;
+                uint64_t pc = s + i * 4, rd = a & 31;
+                int64_t imm = ((int64_t)(((a >> 5) & 0x7ffff) << 2 | ((a >> 29) & 3)) << 43) >> 31;
+                uint64_t page = (pc & ~0xfffULL) + imm;
+                for (uint64_t j = i + 1; j < len / 4 && j <= i + 4; j++) {
+                    uint32_t b = f[j];
+                    if ((b & 0xffc00000) == 0x91000000 && ((b >> 5) & 31) == rd) {
+                        uint64_t tgt = page + ((b >> 10) & 0xfff);
+                        if (tgt >= cAddr && tgt < cAddr + csz) {
+                            NSString *str = [[NSString alloc] initWithBytes:(const void *)(uintptr_t)tgt length:strnlen((const char *)(uintptr_t)tgt, 160) encoding:NSUTF8StringEncoding] ?: @"?";
+                            [idx appendFormat:@"S %llx %@\n", tgt - slide, [str stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]];
+                        }
+                        break;
+                    }
+                }
+            }
+        }];
+        /* named functions, if the game kept any local symbols */
+        NSUInteger nsym = 0;
+        if (st) {
+            const struct nlist_64 *nl = (const void *)(lbase + st->symoff); const char *strs = (const char *)(lbase + st->stroff);
+            for (uint32_t i = 0; i < st->nsyms; i++) if (!(nl[i].n_type & N_STAB) && (nl[i].n_type & N_TYPE) == N_SECT) nsym++;
+        }
+        [idx insertString:[NSString stringWithFormat:@"slide %lx, __text %llx size %lx, __cstring %llx size %lx, %lu function starts, %lu defined symbols, %lu save strings\n",
+                           (long)slide, tAddr - slide, tsz, cAddr - slide, csz, (unsigned long)starts.count, (unsigned long)nsym, (unsigned long)hitStr.count] atIndex:0];
+        NSData *idxD = [idx dataUsingEncoding:NSUTF8StringEncoding];
+        uint32_t il = (uint32_t)idxD.length; NSMutableData *all = [NSMutableData dataWithBytes:&il length:4];
+        [all appendData:idxD]; [all appendData:blob];
+        NSData *z = [all compressedDataUsingAlgorithm:NSDataCompressionAlgorithmZlib error:nil];
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *out = [docs stringByAppendingPathComponent:@"save_code_dump.txt"];
+        NSString *b64 = [z base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength];
+        BOOL ok = b64 && [[NSString stringWithFormat:@"CYPORT-CODE %lu functions %lu bytes, u32 index length + index + code, zlib(raw deflate)+base64\n%@\nEND\n",
+                           (unsigned long)nf, (unsigned long)total, b64] writeToFile:out atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        MSLogf(@"save code dump: %lu save strings, %lu functions use them, %lu written (%lu bytes -> %lu characters) %@ in %@",
+               (unsigned long)hitStr.count, (unsigned long)funcs.count, (unsigned long)nf, (unsigned long)total, (unsigned long)b64.length, ok ? @"ok" : @"FAILED", out);
+    });
+}
+__attribute__((constructor)) static void MSInstallSaveCodeDump(void) { _dyld_register_func_for_add_image(MSSaveCodeDump); }
 
 /* ---------------------------------------------------------------- Bink video (rerouted from libBink2MacArm64) */
 static void *MSBink(const char *sym) {
