@@ -864,60 +864,7 @@ struct SteamResult: LocalizedError {
 
 // MARK: - Steam: playing status, playtime, achievements
 
-/// On a computer the Steam client tells Steam which game is running (the "playing" status and the playtime) and passes
-/// on the achievements the game unlocks. There is no Steam client on iOS: libGameServicesSteam's achievement calls go
-/// nowhere and Steam never hears the game runs. While the game runs CyPort says so itself on its own Steam connection,
-/// and sends the achievements the game unlocked (caught by the shim, Documents/steam_achievements.txt).
-enum SteamPlay {
-    private static var task: Task<Void, Never>?
-    private static var noted: Set<String> = []
-    static var achievementsFile: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("steam_achievements.txt")
-    }
-    static let sentKey = "CyPortSteamAchievementsSent"
-
-    /// called when PLAY is tapped: only for the Steam build with a Steam account signed in
-    static func start() {
-        guard task == nil, SteamStore.shared.signedIn, CloudSource.preferred == .steam || steamBuild() else { return }
-        task = Task.detached(priority: .utility) {
-            var told = false, tries = 0
-            while !Task.isCancelled {
-                do {
-                    let fresh = try await SteamStore.shared.ensureOnline()
-                    if fresh || !told {                    // a new connection (also after a cloud sync): say it again
-                        try await SteamStore.shared.sendPlaying()
-                        if !told { storeLog("steam: playing Cyberpunk 2077 - Steam shows it and counts the playtime") }
-                        told = true
-                    }
-                    await sendAchievements()
-                    tries = 0
-                } catch {
-                    tries += 1
-                    if tries <= 3 { storeLog("steam: playing status: \(error.localizedDescription)") }
-                }
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
-            }
-        }
-    }
-    private static func steamBuild() -> Bool {
-        guard let e = FileManager.default.enumerator(at: Bundle.main.bundleURL, includingPropertiesForKeys: nil) else { return false }
-        for case let u as URL in e where u.lastPathComponent == "libGameServicesSteam.dylib" { return true }
-        return false
-    }
-    static func sendAchievements() async {
-        guard let text = try? String(contentsOf: achievementsFile, encoding: .utf8) else { return }
-        var done = Set(UserDefaults.standard.stringArray(forKey: sentKey) ?? [])
-        var want: [String] = []
-        for l in text.split(separator: "\n") { let n = String(l).trimmingCharacters(in: .whitespaces); if !n.isEmpty, !done.contains(n), !want.contains(n) { want.append(n) } }
-        guard !want.isEmpty, want.contains(where: { !noted.contains($0) }) else { return }
-        do {
-            let sent = try await SteamStore.shared.unlockAchievements(want)
-            done.formUnion(sent); UserDefaults.standard.set(Array(done), forKey: sentKey)
-        } catch { storeLog("steam: achievements: \(error.localizedDescription)") }
-        noted.formUnion(want)               // not in Steam's list: said once, tried again when a new one comes
-    }
-}
-
+/// (SteamPlay in shim/GameCloud.swift drives these while the game runs)
 extension SteamStore {
     /// logged on and connected; true when it had to connect again
     func ensureOnline() async throws -> Bool {
