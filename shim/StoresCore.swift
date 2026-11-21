@@ -599,6 +599,34 @@ struct PBMessage {
     func f32(_ f: Int) -> Float? { if case .fixed32(let v)? = fields[f]?.last { return Float(bitPattern: v) }; return nil }
 }
 
+// MARK: - Valve KeyValues binary (user stats schema)
+
+extension KV {
+    static func parseBinary(_ d: Data) -> KV {
+        let b = [UInt8](d); var i = 0
+        func cstr() -> String { let s = i; while i < b.count && b[i] != 0 { i += 1 }; defer { i += 1 }; return String(decoding: b[s..<min(i, b.count)], as: UTF8.self) }
+        func le(_ n: Int) -> UInt64? { guard i + n <= b.count else { return nil }; var v: UInt64 = 0; for k in 0..<n { v |= UInt64(b[i + k]) << (8 * k) }; i += n; return v }
+        func node(_ n: KV) {
+            while i < b.count {
+                let t = b[i]; i += 1
+                if t == 8 || t == 11 { return }
+                let k = cstr(), c = KV()
+                switch t {
+                case 0: node(c)
+                case 1: c.value = cstr()
+                case 2, 4, 6: guard let v = le(4) else { return }; c.value = String(Int32(truncatingIfNeeded: v))
+                case 3: guard let v = le(4) else { return }; c.value = String(Float(bitPattern: UInt32(v)))
+                case 7, 10: guard let v = le(8) else { return }; c.value = String(v)
+                case 5: while i + 1 < b.count && (b[i] != 0 || b[i + 1] != 0) { i += 2 }; i += 2
+                default: return
+                }
+                n.children.append((k, c))
+            }
+        }
+        let root = KV(); node(root); return root
+    }
+}
+
 // MARK: - Valve KeyValues text (app info)
 
 final class KV {
@@ -651,7 +679,9 @@ actor SteamCM {
         case multi = 1, serviceMethodResponse = 147, serviceMethodCallFromClient = 151, clientHeartBeat = 703, clientLogOnResponse = 751,
              clientLoggedOff = 757, clientGetDepotDecryptionKey = 5438, clientGetDepotDecryptionKeyResponse = 5439, clientLogon = 5514,
              picsProductInfoRequest = 8903, picsProductInfoResponse = 8904, picsAccessTokenRequest = 8905, picsAccessTokenResponse = 8906, clientUFSGetFileListForApp = 5914,
-             serviceMethodCallFromClientNonAuthed = 9804, clientHello = 9805
+             serviceMethodCallFromClientNonAuthed = 9804, clientHello = 9805,
+             clientGetUserStats = 818, clientGetUserStatsResponse = 819, clientStoreUserStatsResponse = 820,
+             clientGamesPlayedWithDataBlob = 5410, clientStoreUserStats2 = 5466
     }
     struct Packet { let emsg: UInt32; let header: PBMessage; let body: Data }
     static let protocolVersion: UInt64 = 65580
@@ -686,6 +716,10 @@ actor SteamCM {
         throw last
     }
     func close() { heartbeat?.cancel(); ws?.cancel(with: .goingAway, reason: nil); ws = nil }
+    /// a message Steam doesn't answer
+    func post(_ e: EMsg, _ body: PBWriter) async throws { try await send(e, body) }
+    /// connected and not failed since
+    var alive: Bool { ws != nil && failure == nil }
 
     private func receiveLoop(_ t: URLSessionWebSocketTask) async {
         while true {
@@ -828,12 +862,115 @@ struct SteamResult: LocalizedError {
     }
 }
 
+// MARK: - Steam: playing status, playtime, achievements
+
+/// On a computer the Steam client tells Steam which game is running (the "playing" status and the playtime) and passes
+/// on the achievements the game unlocks. There is no Steam client on iOS: libGameServicesSteam's achievement calls go
+/// nowhere and Steam never hears the game runs. While the game runs CyPort says so itself on its own Steam connection,
+/// and sends the achievements the game unlocked (caught by the shim, Documents/steam_achievements.txt).
+enum SteamPlay {
+    private static var task: Task<Void, Never>?
+    private static var noted: Set<String> = []
+    static var achievementsFile: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("steam_achievements.txt")
+    }
+    static let sentKey = "CyPortSteamAchievementsSent"
+
+    /// called when PLAY is tapped: only for the Steam build with a Steam account signed in
+    static func start() {
+        guard task == nil, SteamStore.shared.signedIn, CloudSource.preferred == .steam || steamBuild() else { return }
+        task = Task.detached(priority: .utility) {
+            var told = false, tries = 0
+            while !Task.isCancelled {
+                do {
+                    let fresh = try await SteamStore.shared.ensureOnline()
+                    if fresh || !told {                    // a new connection (also after a cloud sync): say it again
+                        try await SteamStore.shared.sendPlaying()
+                        if !told { storeLog("steam: playing Cyberpunk 2077 - Steam shows it and counts the playtime") }
+                        told = true
+                    }
+                    await sendAchievements()
+                    tries = 0
+                } catch {
+                    tries += 1
+                    if tries <= 3 { storeLog("steam: playing status: \(error.localizedDescription)") }
+                }
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+        }
+    }
+    private static func steamBuild() -> Bool {
+        guard let e = FileManager.default.enumerator(at: Bundle.main.bundleURL, includingPropertiesForKeys: nil) else { return false }
+        for case let u as URL in e where u.lastPathComponent == "libGameServicesSteam.dylib" { return true }
+        return false
+    }
+    static func sendAchievements() async {
+        guard let text = try? String(contentsOf: achievementsFile, encoding: .utf8) else { return }
+        var done = Set(UserDefaults.standard.stringArray(forKey: sentKey) ?? [])
+        var want: [String] = []
+        for l in text.split(separator: "\n") { let n = String(l).trimmingCharacters(in: .whitespaces); if !n.isEmpty, !done.contains(n), !want.contains(n) { want.append(n) } }
+        guard !want.isEmpty, want.contains(where: { !noted.contains($0) }) else { return }
+        do {
+            let sent = try await SteamStore.shared.unlockAchievements(want)
+            done.formUnion(sent); UserDefaults.standard.set(Array(done), forKey: sentKey)
+        } catch { storeLog("steam: achievements: \(error.localizedDescription)") }
+        noted.formUnion(want)               // not in Steam's list: said once, tried again when a new one comes
+    }
+}
+
+extension SteamStore {
+    /// logged on and connected; true when it had to connect again
+    func ensureOnline() async throws -> Bool {
+        if await cm.alive, loggedOnNow { return false }
+        try await logOn(); return true
+    }
+    func sendPlaying() async throws {
+        var g = PBWriter(); g.fixed64(2, UInt64(Game.steamApp))
+        var b = PBWriter(); b.msg(1, g); b.u(2, 16)
+        try await cm.post(.clientGamesPlayedWithDataBlob, b)
+    }
+    /// sets these achievements (Steam API names, as the game passes them) on Steam; returns the ones set
+    func unlockAchievements(_ names: [String]) async throws -> [String] {
+        let app = UInt64(Game.steamApp), me = await cm.steamID
+        var q = PBWriter(); q.fixed64(1, app); q.u(2, 0); q.i(3, -1); q.fixed64(4, me)
+        let r = try PBMessage(try await cm.call(.clientGetUserStats, q, timeout: 30).body)
+        guard (r.i32(2) ?? 2) == 1 else { throw SteamResult(code: r.i32(2) ?? 2, message: "reading achievements") }
+        guard let schema = r.data(4) else { throw StoreError("Steam sent no achievement list") }
+        let kv = KV.parseBinary(schema)
+        var values: [UInt32: UInt32] = [:]
+        for raw in r.all(5) { let s = try PBMessage(raw); if let id = s.u(1) { values[UInt32(id)] = UInt32(truncatingIfNeeded: s.u(2) ?? 0) } }
+        var bitOf: [String: (stat: UInt32, bit: UInt32)] = [:]
+        for (sid, st) in (kv.children.first?.1["stats"] ?? kv["stats"])?.children ?? [] {
+            guard let s = UInt32(sid), let bits = st["bits"] else { continue }
+            for (bit, b) in bits.children { if let n = b["name"]?.value, let k = UInt32(bit), k < 32 { bitOf[n.lowercased()] = (s, k) } }
+        }
+        var changed: [UInt32: UInt32] = [:], set: [String] = []
+        for n in names {
+            guard let at = bitOf[n.lowercased()] else {
+                storeLog("steam: achievement \"\(n)\" isn't in Steam's list (\(bitOf.count) there, e.g. \(bitOf.keys.sorted().prefix(4).joined(separator: ", ")))")
+                continue
+            }
+            let s = at.stat, k = at.bit, v = changed[s] ?? values[s] ?? 0
+            if v & (1 << k) != 0 { set.append(n); continue }          // already unlocked on Steam
+            changed[s] = v | (1 << k); set.append(n)
+        }
+        guard !changed.isEmpty else { return set }
+        var w = PBWriter(); w.fixed64(1, app); w.fixed64(2, me); w.fixed64(3, me); w.u(4, r.u(3) ?? 0); w.b(5, false)
+        for (s, v) in changed { var st = PBWriter(); st.u(1, UInt64(s)); st.u(2, UInt64(v)); w.msg(6, st) }
+        let a = try PBMessage(try await cm.call(.clientStoreUserStats2, w, timeout: 30).body)
+        guard (a.i32(2) ?? 2) == 1 else { throw SteamResult(code: a.i32(2) ?? 2, message: "saving achievements") }
+        storeLog("steam: achievements unlocked on Steam: \(set.joined(separator: ", "))")
+        return set
+    }
+}
+
 // MARK: - Steam: sign-in, app info, download plan
 
 final class SteamStore: @unchecked Sendable {
     static let shared = SteamStore()
     let cm = SteamCM()
     private var loggedOn = false
+    var loggedOnNow: Bool { loggedOn }
     var account: String? { Keychain.load("steam")?["account"] as? String }
     var signedIn: Bool { account != nil }
     private var deviceName: String { "CyPort" }

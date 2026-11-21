@@ -325,7 +325,7 @@ private struct LauncherView: View {
                         guard !model.starting, !model.syncing else { return }
                         if model.dataNeedsUpdate { model.askUpdate = true; return }
                         model.starting = true
-                        GameCloud.startWatching()
+                        GameCloud.startWatching(); SteamPlay.start()
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         model.onPlay(model.resolution, model.overlay)
                     } label: {
@@ -391,7 +391,7 @@ private struct LauncherView: View {
         .alert("Game data doesn't match", isPresented: $model.askUpdate) {
             Button("Update Cyberpunk") { model.updating = true }
             Button("Play anyway", role: .destructive) {
-                model.starting = true; GameCloud.startWatching(); model.onPlay(model.resolution, model.overlay)
+                model.starting = true; GameCloud.startWatching(); SteamPlay.start(); model.onPlay(model.resolution, model.overlay)
             }
             Button("Cancel", role: .cancel) {}
         } message: {

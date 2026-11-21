@@ -6153,11 +6153,56 @@ static const char *g_gsNames[] = { "CheckAdditionalContentStatus", "CloudSaveRea
     "SaveDataToCloud", "SetAddtionalContentInstallCallback", "SetCommandLineHandler", "SetLogger", "SetNetworkState", "SetOverlayHandler",
     "SetRichPresence", "SignIn", "SyncAchievement", "SyncAchievementList", "Uninitialize", "UnlockAchievement", "VerifyDataIntegrity" };
 #define MS_NGS (sizeof g_gsNames / sizeof *g_gsNames)
-static MSGSFn g_gsReal[MS_NGS]; static _Atomic int g_gsCalls[MS_NGS];
+static MSGSFn g_gsReal[MS_NGS]; static _Atomic int g_gsCalls[MS_NGS]; static BOOL g_gsAudit;
+/* a C string or a libc++ std::string at a, read safely (no crash on a non-pointer); NULL if it isn't printable text */
+static const char *MSPeekText(uint64_t a, char *buf, size_t n) {
+    if (a < 0x100000000ULL || a > 0x0000fffffffff000ULL) return NULL;
+    uint8_t raw[64]; vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)a, sizeof raw, (vm_address_t)raw, &got) != KERN_SUCCESS || got != sizeof raw) return NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        const uint8_t *t = raw; uint8_t ind[64];
+        if (pass == 1) {                                     /* libc++ std::string: long (pointer first) or short (inline) */
+            if (raw[23] & 0x80) {
+                uint64_t q; memcpy(&q, raw, 8);
+                if (q < 0x100000000ULL || q > 0x0000fffffffff000ULL) return NULL;
+                if (vm_read_overwrite(mach_task_self(), (vm_address_t)q, sizeof ind, (vm_address_t)ind, &got) != KERN_SUCCESS || got != sizeof ind) return NULL;
+                t = ind;
+            } else return NULL;
+        }
+        size_t k = 0; while (k < 63 && k < n - 1 && t[k] >= 0x20 && t[k] < 0x7f) { buf[k] = (char)t[k]; k++; }
+        if (k >= 3 && (k == 63 || k == n - 1 || t[k] == 0)) { buf[k] = 0; return buf; }
+    }
+    return NULL;
+}
+/* achievements: without a Steam client, libGameServicesSteam drops them. Each one the game unlocks is logged and kept in
+   Documents/steam_achievements.txt; CyPort sends them to Steam itself (shim/StoresCore.swift, SteamStore.achievements) */
+static void MSGSAchievement(const char *fn, uint64_t a, uint64_t b, uint64_t c, uint64_t d, int n) {
+    char s0[64], s1[64], s2[64], s3[64];
+    const char *t[4] = { MSPeekText(a, s0, sizeof s0), MSPeekText(b, s1, sizeof s1), MSPeekText(c, s2, sizeof s2), MSPeekText(d, s3, sizeof s3) };
+    if (n < 40) MSLogf(@"steam services: game calls %s(%#llx \"%s\", %#llx \"%s\", %#llx \"%s\", %#llx \"%s\") (call %d)", fn,
+                       a, t[0] ?: "", b, t[1] ?: "", c, t[2] ?: "", d, t[3] ?: "", n + 1);
+    if (strcmp(fn, "UnlockAchievement")) return;
+    const char *name = NULL; for (int k = 0; k < 4 && !name; k++) name = t[k];
+    if (!name) return;
+    static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    NSString *ns = @(name);
+    @synchronized (seen) { if ([seen containsObject:ns]) return; [seen addObject:ns]; }
+    MSLogf(@"steam achievement: game unlocks %@", ns);
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *p = [docs stringByAppendingPathComponent:@"steam_achievements.txt"];
+    @synchronized (seen) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) { [NSData.data writeToFile:p atomically:NO]; fh = [NSFileHandle fileHandleForWritingAtPath:p]; }
+        [fh seekToEndOfFile]; [fh writeData:[[ns stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile];
+    }
+}
 static uint64_t MSGSCall(int i, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
     uint64_t r = g_gsReal[i](a, b, c, d, e, f, g, h);
     int n = g_gsCalls[i]++;
-    if (n < 12) {
+    const char *fn = g_gsNames[i];
+    if (!strcmp(fn, "UnlockAchievement") || !strcmp(fn, "SyncAchievement") || !strcmp(fn, "SyncAchievementList") || !strcmp(fn, "SetRichPresence"))
+        MSGSAchievement(fn, a, b, c, d, n);
+    else if (g_gsAudit && n < 12) {
         BOOL str = !strcmp(g_gsNames[i], "GetPlatformName") || !strcmp(g_gsNames[i], "GetLanguageCodeName") || !strcmp(g_gsNames[i], "GetLibraryVersion");
         MSLogf(@"steam services: game calls %s(%#llx, %#llx, %#llx, %#llx) -> %#llx%s%s%s (call %d)", g_gsNames[i], a, b, c, d, r,
                str && r > 0x100000000ULL ? " \"" : "", str && r > 0x100000000ULL ? (const char *)r : "", str && r > 0x100000000ULL ? "\"" : "", n + 1);
@@ -6174,7 +6219,7 @@ static void *g_rDlsym;
 static void *w_dlsym(void *h, const char *name) {
     void *r = ((void *(*)(void *, const char *))g_rDlsym)(h, name);
     Dl_info d; BOOL gs = r && dladdr(r, &d) && d.dli_fname && strstr(d.dli_fname, "libGameServices");
-    static _Atomic int n; if (gs || n++ < 60) MSLogf(@"steam services: game looks up %s -> %p%s", name ?: "(null)", r, gs ? " (GameServices)" : "");
+    static _Atomic int n; if (g_gsAudit && (gs || n++ < 60)) MSLogf(@"steam services: game looks up %s -> %p%s", name ?: "(null)", r, gs ? " (GameServices)" : "");
     if (gs) for (size_t i = 0; i < MS_NGS; i++) if (!strcmp(name, g_gsNames[i])) { g_gsReal[i] = (MSGSFn)r; return g_gsWrap[i]; }
     return r;
 }
@@ -6231,9 +6276,12 @@ static id w_dataFileOpt(id s, SEL c, NSString *p, NSUInteger o, NSError **err) {
 static void MSSwizzle(Class c, SEL s, IMP w, IMP *old) { Method m = class_getInstanceMethod(c, s); if (m) *old = method_setImplementation(m, w); }
 static void MSSaveAudit3(const struct mach_header *mh, intptr_t slide) {
     Dl_info di; if (!dladdr(mh, &di) || !di.dli_fname || !strstr(di.dli_fname, "CyberpunkGame.dylib")) return;
-    if (![MSConfig()[@"SaveAudit3"] boolValue]) return;          /* diagnostic: only with SaveAudit3 = YES */
     g_gameMH = mh;
     g_rDlsym = dlsym(RTLD_DEFAULT, "dlsym");
+    /* always: the game's GameServices lookups go through w_dlsym, for the achievement calls (MSGSAchievement) */
+    g_gsAudit = [MSConfig()[@"SaveAudit3"] boolValue];
+    if (!g_gsAudit) { MSLogf(@"steam services: achievement calls watched (dlsym slot %d)", MSWrapSlot(mh, g_rDlsym, w_dlsym)); return; }
+    /* the rest is diagnostic: only with SaveAudit3 = YES */
     g_rFbOpen = dlsym(RTLD_DEFAULT, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj");
     g_rFsStatus = dlsym(RTLD_DEFAULT, "_ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE");
     int a = MSWrapSlot(mh, g_rDlsym, w_dlsym), b = MSWrapSlot(mh, g_rFbOpen, w_fbopen), c = MSWrapSlot(mh, g_rFsStatus, w_fsstatus);
