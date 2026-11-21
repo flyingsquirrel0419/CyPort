@@ -5285,6 +5285,19 @@ static NSString *MSPoolUsage(void) {
     }
     return m;
 }
+/* the loading screen / performance overlay: drawn on the main thread when the game runs on its own thread. A
+   CATransaction committed from a background thread also lays out the overlay window's views when UIKit has marked
+   them, and UIKit then throws "Modifications to the layout engine must not be performed from a background thread"
+   (a crash, 2026-11-22). With the game on the main thread (fallback), the main thread is busy for seconds while it
+   loads: there the overlay stays on this thread as before. One update in flight at a time. */
+static _Atomic int g_ovPending;
+static void MSOverlayDo(dispatch_block_t b) {
+    if (g_offMain) {
+        if (g_ovPending) return;
+        g_ovPending = 1;
+        MSMainAsync(^{ [CATransaction begin]; [CATransaction setDisableActions:YES]; b(); [CATransaction commit]; g_ovPending = 0; });
+    } else { [CATransaction begin]; [CATransaction setDisableActions:YES]; b(); [CATransaction commit]; [CATransaction flush]; }
+}
 static void MSStartReadProgress(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -5340,7 +5353,7 @@ static void MSStartReadProgress(void) {
             if (done) {                                                 /* from now on: the overlay picked on the start screen */
                 static NSInteger ov = -1; if (ov < 0) ov = MSPref(@"MacShimOverlay", 1);
                 if (ov == 0) {                                          /* Off */
-                    if (!g_stBg.hidden) { [CATransaction begin]; [CATransaction setDisableActions:YES]; g_stBg.hidden = YES; [CATransaction commit]; [CATransaction flush];
+                    if (!g_stBg.hidden) { MSOverlayDo(^{ g_stBg.hidden = YES; });
                         MSMainAsync(^{ g_statusWin.hidden = YES; }); }            /* no window left over the game: nothing to composite */
                     continue;
                 }
@@ -5349,13 +5362,13 @@ static void MSStartReadProgress(void) {
                                       : [NSString stringWithFormat:@"%@  %.1f ms   RAM %.1f GB%@", fs, fps > 0.5 ? 1000 / fps : 0, mem / 1024,
                                          NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious ? @"   HOT" : @""];
                 CGFloat pw = ov == 2 ? 400 : 210;
-                [CATransaction begin]; [CATransaction setDisableActions:YES];
+                MSOverlayDo(^{
                 CGRect R = g_stRoot.bounds;
                 g_stBg.frame = CGRectMake(R.size.width / 2 - pw / 2, g_stTopGap, pw, 20);       /* top centre (the keys there sit below it) */ g_stBg.cornerRadius = 10;
                 g_stBg.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45].CGColor;
                 g_stTitle.hidden = g_stLog.hidden = g_stTrack.hidden = YES;
                 g_stHead.frame = CGRectMake(10, 2, pw - 20, 16); g_stHead.alignmentMode = kCAAlignmentCenter; g_stHead.fontSize = 11; g_stHead.string = f;
-                [CATransaction commit]; [CATransaction flush];
+                });
                 continue;
             }
             int el = (int)(now - t0); double frac = MIN(b / expect, 0.97); if (saved) frac = 1;
@@ -5370,7 +5383,8 @@ static void MSStartReadProgress(void) {
             BOOL busy = cpuPct > 15 || idle < 3;
             NSString *title = [NSString stringWithFormat:@"%s  Loading Cyberpunk 2077…  %.0f%%%@", busy ? spin[tick % 4] : "•", frac * 100,
                                [NSUserDefaults.standardUserDefaults objectForKey:@"MacShimLoadBytes"] ? @"" : @" (estimate)"];
-            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            NSString *logText = [lines componentsJoinedByString:@"\n"];
+            MSOverlayDo(^{
             CGRect R = g_stRoot.bounds; CGFloat pad = g_stPad;           /* no UIKit off the main thread: insets were read at start */
             CGFloat x = pad, w = R.size.width - 2 * pad; UIEdgeInsets in = UIEdgeInsetsMake(pad - 12, pad, pad - 12, pad);
             if (compact) {                                              /* the game shows its own screen: a thin strip at the bottom */
@@ -5383,11 +5397,11 @@ static void MSStartReadProgress(void) {
                 g_stTitle.frame = CGRectMake(x, y, w, 26); g_stTrack.frame = CGRectMake(x, y + 36, w, 8);
                 g_stHead.frame = CGRectMake(x, y + 54, w, 18);
                 g_stLog.frame = CGRectMake(x, y + 84, w, R.size.height - y - 84 - MAX(16, in.bottom));
-                g_stTitle.string = title; g_stLog.string = [lines componentsJoinedByString:@"\n"];
+                g_stTitle.string = title; g_stLog.string = logText;
             }
             g_stFill.frame = CGRectMake(0, 0, g_stTrack.bounds.size.width * frac, g_stTrack.bounds.size.height);
             g_stHead.string = head;
-            [CATransaction commit]; [CATransaction flush];
+            });
         }
     });
     });
