@@ -871,9 +871,10 @@ extension SteamStore {
         if await cm.alive, loggedOnNow { return false }
         try await logOn(); return true
     }
-    func sendPlaying() async throws {
+    /// tells Steam the game runs (true) or no game runs (false) on this connection
+    func sendPlaying(_ on: Bool) async throws {
         var g = PBWriter(); g.fixed64(2, UInt64(Game.steamApp))
-        var b = PBWriter(); b.msg(1, g); b.u(2, 16)
+        var b = PBWriter(); if on { b.msg(1, g) }; b.u(2, 16)
         try await cm.post(.clientGamesPlayedWithDataBlob, b)
     }
     /// sets these achievements (Steam API names, as the game passes them) on Steam; returns the ones set

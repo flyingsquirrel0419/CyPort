@@ -46,6 +46,7 @@ enum CloudSource: String, CaseIterable, Identifiable {
         switch self {
         case .gog: for slot in slots { try await GOGCloud.send(files.filter { $0.rel.hasPrefix(slot + "/") }) }
         case .steam:
+            await SteamPlay.beginUpload(); defer { SteamPlay.endUpload() }
             // one slot per upload batch, one after another: all of them in one batch got result 108 (too many
             // pending) on every try once a few slots were waiting (2026-11-21). Slots that went up count even when a
             // later one fails; the rest go next time.
@@ -614,9 +615,24 @@ enum SteamCloud {
             GameCloud.log("Steam: closed upload batch \(id) left open by an earlier upload")
             return true
         }
+        /// result 10 (busy): Steam still has the game running for this account (a session that ended without saying
+        /// so, or a computer playing it right now): it's tried 3 times 5 s apart, then the save goes at the next sync
+        func begin(_ b: PBWriter) async throws -> UInt64 {
+            for n in 0..<3 {
+                do { return try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0 }
+                catch let e as SteamResult where e.code == 10 && n < 2 {
+                    GameCloud.log("Steam: busy (10) - is Cyberpunk running on Steam for this account (another device, or CyPort closed while playing)? Trying again in 5 s")
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+                catch let e as SteamResult where e.code == 10 {
+                    throw StoreError("Steam is busy: it thinks Cyberpunk 2077 is still running for this account (on another device, or CyPort was closed while playing - Steam drops that after a few minutes). The saves go up at the next sync.")
+                }
+            }
+            throw StoreError("Steam is busy")
+        }
         _ = await closeStale()
         let batch: UInt64
-        do { batch = try await cm.service("Cloud.BeginAppUploadBatch#1", b, authed: true).u(1) ?? 0 }
+        do { batch = try await begin(b) }
         catch let e as SteamResult where e.code == 108 {
             // Steam still counts earlier uploads as pending: wait a little longer each time (10, 20, 40 s)
             var got: UInt64? = nil, wait: UInt64 = 10
@@ -900,17 +916,41 @@ enum SteamPlay {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("steam_achievements.txt")
     }
     static let sentKey = "CyPortSteamAchievementsSent"
+    /// the game counts as running on Steam (not in the background, no Steam Cloud upload going on)
+    private static let lock = NSLock()
+    private static var _background = false, _uploads = 0, _said = false
+    private static func locked<T>(_ f: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return f() }
+    private static var shouldPlay: Bool { locked { task != nil && !_background && _uploads == 0 } }
+
+    /// Steam answers a Steam Cloud upload with result 10 (busy) while the account plays the game - the Steam client
+    /// only uploads after the game quits. Around an upload CyPort says "not playing", then "playing" again.
+    static func beginUpload() async {
+        let was = locked { () -> Bool in _uploads += 1; return _said }
+        if was { try? await SteamStore.shared.sendPlaying(false); locked { _said = false }; try? await Task.sleep(nanoseconds: 2_000_000_000) }
+    }
+    static func endUpload() { locked { _uploads -= 1 } }
 
     /// called when PLAY is tapped: only for the Steam build with a Steam account signed in
     static func start() {
         guard task == nil, SteamStore.shared.signedIn, CloudSource.preferred == .steam || steamBuild() else { return }
+        // in the background the game isn't played (and iOS may end the app there: Steam would keep "playing" until its
+        // connection times out, and refuse the next upload with "busy")
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { _ in
+            let was = locked { () -> Bool in _background = true; return _said }
+            if was { Task { try? await SteamStore.shared.sendPlaying(false); locked { _said = false }; storeLog("steam: in the background - not playing") } }
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil) { _ in
+            locked { _background = false }
+        }
         task = Task.detached(priority: .utility) {
             var told = false, tries = 0
             while !Task.isCancelled {
                 do {
                     let fresh = try await SteamStore.shared.ensureOnline()
-                    if fresh || !told {                    // a new connection (also after a cloud sync): say it again
-                        try await SteamStore.shared.sendPlaying()
+                    let said = locked { _said }
+                    if shouldPlay && (fresh || !said) {     // a new connection (also after a cloud sync) or back: say it again
+                        locked { _said = true }
+                        try await SteamStore.shared.sendPlaying(true)
                         if !told { storeLog("steam: playing Cyberpunk 2077 - Steam shows it and counts the playtime") }
                         told = true
                     }
